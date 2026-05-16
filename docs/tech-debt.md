@@ -6,7 +6,15 @@ Each entry has a short title, a brief description of what is owed, the slice or 
 
 ## Active debt
 
-This section lists active debt entries. At project start, the register is empty because no code has been written yet and no decisions have been deferred. Entries will accumulate as Phase 0 and Phase 1 proceed.
+This section lists active debt entries.
+
+### Secret scanning and secret scanning push protection unavailable at current GitHub plan tier
+
+- **What is owed:** Enable repository-level secret scanning and secret scanning push protection for the `addressanup/fleetco` repository, satisfying in full the four-feature commitment in ADR-0012. Today, only two of the four (Dependabot alerts and Dependabot security updates) are enabled.
+- **Where surfaced:** Phase 0 — Ticket 1 (repository bootstrap), first commit on `main`. The `gh api -X PATCH` calls to set `security_and_analysis.secret_scanning.status=enabled` and `security_and_analysis.secret_scanning_push_protection.status=enabled` both returned HTTP 422 with body `"Secret scanning is not available for this repository."` The repo's `security_and_analysis` field comes back as `null`, GitHub's signal that the feature is not offered for this repo/account combination — not a payload error. Verified by also attempting `secret_scanning` alone, which fails identically.
+- **Why accepted now:** GitHub does not include repository-level secret scanning on private repos at the Free plan tier. Enabling it requires the GitHub Secret Protection add-on (≈$19/active-committer/month at announced pricing) or the larger GitHub Advanced Security bundle. Phase 0 contains no real secrets in the repository (only documentation), so the absence of repo-level scanning is low-risk in the immediate term. Defense-in-depth is partially provided by (a) GitHub's user-level push protection, which scans every push from the account across all repos and is free and on by default, and (b) the Semgrep job arriving in Ticket 12 per ADR-0012, whose `p/security-audit` ruleset includes secret-pattern detection that overlaps with what GitHub's scanner would catch.
+- **Estimate to discharge:** ~10 minutes once the account is on a tier that includes secret scanning. The original `gh api -X PATCH` payload should then succeed unchanged; verification is one read-only `gh api /repos/addressanup/fleetco --jq '.security_and_analysis'` call.
+- **Revisit when:** any of: (a) Phase 1 begins, because that is when real secrets (database password, Cloudflare R2 credentials, session secret, Sentry DSN) enter the project's operational surface, even if scoped to a local `.env`; (b) the project moves to a GitHub organization account or upgrades to a paid plan for any other reason; (c) GitHub changes the bundling or pricing of secret scanning in a way that makes enablement cheap or free.
 
 ## Paid-off debt
 
