@@ -1,0 +1,39 @@
+# ADR-0010: DORA measurement and Phase 1 delivery targets
+
+- **Status:** Accepted
+- **Date:** 2026-05-09
+- **Decider:** Product owner (CEO)
+
+## Context
+
+The Accelerate research program from DORA (DevOps Research and Assessment), now in its tenth year of the State of DevOps reports, has converged on a small set of metrics that consistently distinguish high-performing software delivery teams from the rest. The four canonical metrics are deployment frequency, lead time for changes (from commit merged to running in production), change failure rate (the percentage of deployments that cause user-impacting failures), and failed deployment recovery time (how long it takes to restore service after a failed deployment). The 2025 State of DevOps report formalized a fifth metric, rework rate, capturing how often shipped changes have to be revisited because they did not work as intended.
+
+The 2024 DORA report found a counterintuitive negative correlation between AI adoption and delivery performance: teams adopting AI saw a small but real decrease in throughput and a larger decrease in stability. The 2025 report partially reversed this finding, showing that AI now correlates positively with throughput in teams whose engineering substrate is sound, but still correlates with reduced stability where the substrate is weak. The recurring conclusion across both reports is that AI is an amplifier of whatever discipline already exists in the engineering practice. For a project like FleetCo, which is being built primarily by an AI coding agent, this finding is not academic. It is the strongest available argument that the disciplines we have committed to in earlier ADRs (TypeScript-strict-everywhere, vertical slices, main-always-green, feature flags, modular monolith with explicit boundaries) are the preconditions that determine whether AI velocity translates into delivery throughput or into instability.
+
+The bootstrap we have built so far has the architectural and procedural preconditions for elite-tier delivery, but it does not yet have the measurement layer that the DORA framework actually rests on. Without measurement, we cannot tell whether the AI agent is making us better or worse, and we cannot detect the failure modes (such as growing batch size or rising change-failure rate under AI assistance) that DORA has shown to be the leading indicators of trouble.
+
+## Decision
+
+We commit to instrumenting the four canonical DORA metrics plus the rework rate from the moment Phase 1's first production deploy ships. The metrics are derived from sources we already have: deployment frequency from GitHub Actions deployment workflow runs, lead time for changes from the timestamp difference between PR merge and production deploy completion, change failure rate from the count of deployments followed by a Sentry-detected error spike or a manual rollback within 24 hours, failed deployment recovery time from the timestamp between a detected failure and the deploy that restored service, and rework rate from the count of follow-up PRs that fix or revise a previously merged change within 14 days. These are not perfect operational definitions but they are honest, reproducible from data we already collect, and good enough to detect trends.
+
+For Phase 1, the targets we commit to are the following. Deployment frequency is at least one production deploy per working day on average, measured weekly. Lead time for changes is under 24 hours from PR merge to production deploy, measured at the median. Change failure rate is under 15 percent, measured monthly. Failed deployment recovery time is under two hours at the 90th percentile. Rework rate is under 25 percent, measured monthly. These targets are deliberately not the elite-tier numbers from the 2024 DORA report, which require dedicated reliability engineering and platform investment we do not have at this scale. They are the medium-tier numbers that are realistically achievable for a one-person shop with an AI agent, and they are good enough to keep us in the same conversation as the high-performing teams DORA studies.
+
+The metrics are recorded in `docs/operations/dora-metrics.md`, which is updated weekly in the same PR that closes the week's work. When a target is missed in a given measurement window, the next planning conversation must address what changed and what we will do about it, before any new feature work begins.
+
+## Alternatives considered
+
+Adopting the elite-tier DORA targets directly was considered and rejected as setting up the project to fail. Elite teams achieve multi-deploy-per-day frequency, sub-one-hour lead time, sub-five-percent change failure rate, and sub-one-hour recovery time. Reaching these levels requires investments in deployment automation, blue-green or canary infrastructure, comprehensive test automation, and observability pipelines that a Phase 1 bootstrap does not have and probably should not have at this stage. Setting elite targets we cannot meet would either produce constant failure signals or pressure us into shortcuts that compromise the disciplines that actually produce elite delivery in the long run.
+
+Skipping measurement entirely until Phase 2 was considered and rejected on the grounds that the 2025 DORA finding makes measurement urgent specifically because we are AI-amplified. Without measurement, we cannot detect the moment when AI velocity starts producing instability rather than throughput, which is the failure mode the framework has shown to be most likely.
+
+Adopting the SPACE framework's broader productivity dimensions instead of DORA's delivery metrics was considered and partially adopted. SPACE's insistence that productivity be measured along satisfaction, performance, activity, communication, and efficiency simultaneously is sound, but its operational specifics are harder to instrument for a solo project than DORA's. The right synthesis is to measure the four DORA metrics rigorously and to add a quarterly self-administered satisfaction check (energy, dread, weeks since last day off) as a leading indicator of founder burnout, which is the largest existential risk to a solo bootstrapped business. The DORA metrics are codified in this ADR; the satisfaction check is codified informally in the runbook.
+
+## Consequences
+
+We acquire a real measurement layer for delivery, which means we can detect trends and react to them rather than discovering problems after they have compounded. We pay the cost of weekly metric updates, which is small (10-15 minutes weekly) once the data sources are wired up. We commit to acting on missed targets, which means that if change failure rate creeps above 15 percent in a month, the next planning conversation has to address it before new features ship. This is the kind of commitment that is easy to make in writing and hard to honor in practice; the discipline is what separates teams that improve from teams that drift.
+
+Because the measurement is light and the targets are realistic, the cost of this commitment is small. The benefit is that we have an early warning system for the failure modes the AI-assisted-development literature has documented, and we have evidence to share with future contributors or customers about how the project actually delivers software.
+
+## Revisit when
+
+The signal to revisit the targets is when we have eight to twelve weeks of data on Phase 1 operations and can see whether the targets we set were too easy, too hard, or just right. The targets should tighten over time as the project matures: by the end of Phase 2, deployment frequency should be approaching multi-deploy-per-day in the busy slices, lead time should be under 12 hours, change failure rate should be under 10 percent, and recovery time should be under one hour. The signal to revisit the metrics themselves is when DORA publishes a new annual State of DevOps report with materially different definitions or new metrics worth adopting.

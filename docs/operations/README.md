@@ -1,0 +1,7 @@
+# Operations
+
+This folder is the project's operational memory: the home for measurements, metrics, and operational records that do not fit cleanly into the five primary memory categories (episodic in ADRs, semantic in glossary, procedural in runbook, prospective in roadmap and tech-debt, perceptual in design folder). Operational memory sits at the intersection of procedural memory (because operations are activities done over time) and prospective memory (because the records inform future planning), but it is distinct enough in character that giving it its own folder makes the bootstrap easier to navigate.
+
+The files in this folder are updated on regular cadences rather than in response to specific work. The DORA metrics file is updated weekly. Other files added later may be updated monthly or quarterly. The discipline is that operational memory updates are not optional follow-up work; they are part of the regular rhythm of the project, and they are committed to the repository like any other piece of memory rather than living in spreadsheets or external dashboards.
+
+The file `dora-metrics.md` records the four canonical DORA metrics plus the rework rate, measured weekly from CI and Sentry data. The targets and the framework are documented in ADR-0010. Future operational memory files may include SLO compliance reports (referenced in ADR-0011), security baseline reports, and quarterly satisfaction and burnout self-assessments. Each file documents its own update cadence at the top.
