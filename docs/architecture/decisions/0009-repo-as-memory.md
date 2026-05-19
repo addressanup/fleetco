@@ -1,6 +1,6 @@
 # ADR-0009: The repository is the project's memory
 
-- **Status:** Accepted
+- **Status:** Accepted; superseded in part by ADR-0017
 - **Date:** 2026-05-09
 - **Decider:** Product owner (CEO)
 
