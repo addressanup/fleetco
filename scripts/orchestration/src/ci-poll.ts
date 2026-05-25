@@ -78,45 +78,48 @@ export async function pollCi(prNumber: number, options: PollOptions = {}): Promi
 
   while (true) {
     if (options.onPoll) options.onPoll(Date.now() - startedAt);
+    // `gh pr checks --json` returns rows shaped like:
+    //   { name, state: "SUCCESS"|"FAILURE"|"PENDING"|"IN_PROGRESS"|..., bucket: "pass"|"fail"|"pending"|"skipping" }
+    // The `bucket` field rolls up the many possible `state` values into three
+    // coarse buckets, which is what we actually want here. We also include
+    // `state` in the query so a failed-check message can include the precise
+    // GitHub state (e.g. "FAILURE" vs "CANCELLED" vs "TIMED_OUT").
+    //
+    // Earlier versions of this code queried `--json state,conclusion` and
+    // checked `state === "COMPLETED"` — that's the GraphQL CheckRun schema,
+    // NOT the `gh pr checks` JSON schema. The conditions never matched,
+    // and the loop polled until timeout regardless of CI outcome. Surfaced
+    // by iter 2 of the Phase 1 Vehicles slice (PR #25): CI failed at 28s,
+    // but the loop polled for 45min and halted with ci_timeout.
     const { stdout, exitCode } = await runGh([
       "pr",
       "checks",
       String(prNumber),
       "--json",
-      "name,state,conclusion",
+      "name,state,bucket",
     ]);
     if (exitCode === 0) {
       try {
         const checks = JSON.parse(stdout) as {
           name: string;
           state: string;
-          conclusion: string | null;
+          bucket: string;
         }[];
         // Treat empty checks array as "no checks reported yet" — keep waiting.
         if (checks.length > 0) {
-          const allDone = checks.every((c) => c.state === "COMPLETED");
-          const anyFailed = checks.some(
-            (c) =>
-              c.state === "COMPLETED" &&
-              c.conclusion !== "SUCCESS" &&
-              c.conclusion !== "NEUTRAL" &&
-              c.conclusion !== "SKIPPED",
+          const anyFailed = checks.some((c) => c.bucket === "fail");
+          const allFinal = checks.every(
+            (c) => c.bucket === "pass" || c.bucket === "fail" || c.bucket === "skipping",
           );
           if (anyFailed) {
-            const failed = checks.find(
-              (c) =>
-                c.state === "COMPLETED" &&
-                c.conclusion !== "SUCCESS" &&
-                c.conclusion !== "NEUTRAL" &&
-                c.conclusion !== "SKIPPED",
-            );
+            const failed = checks.find((c) => c.bucket === "fail");
             return {
               status: "red",
-              ...(failed ? { failedCheck: `${failed.name} (${failed.conclusion})` } : {}),
+              ...(failed ? { failedCheck: `${failed.name} (${failed.state})` } : {}),
               details: `Failed check on PR #${prNumber}. Operator must inspect; the loop does NOT auto-fix (principle 10).`,
             };
           }
-          if (allDone) {
+          if (allFinal) {
             return { status: "green" };
           }
         }
