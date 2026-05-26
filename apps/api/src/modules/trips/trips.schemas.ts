@@ -135,14 +135,19 @@ function intParam(min: number, max: number, fieldLabel: string) {
 // service builds a Prisma `where vehicleId = ?` filter; a non-existent
 // id naturally returns the empty result set, which is the right UX
 // for a "trips for this vehicle" URL that survives a deleted vehicle.
-// We trim and reject empty strings so `?vehicleId=` is treated as
-// "no filter" rather than "match the empty-string id".
+// An empty string (e.g., from `?vehicleId=`) is normalized to undefined
+// so the service omits the filter rather than asking Prisma for
+// `where vehicleId = ''`. We accept any non-empty string (no cuid
+// format check): the kickoff explicitly allows "accept any string and
+// let the service no-op" on unknown ids.
 const IdFilter = z
   .string()
-  .trim()
-  .min(1)
   .optional()
-  .transform((raw) => (raw === undefined || raw === "" ? undefined : raw));
+  .transform((raw) => {
+    if (raw === undefined) return undefined;
+    const trimmed = raw.trim();
+    return trimmed.length === 0 ? undefined : trimmed;
+  });
 
 export const ListTripsQuerySchema = z
   .object({
