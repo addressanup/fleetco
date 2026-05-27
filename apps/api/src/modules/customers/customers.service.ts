@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import { Prisma, type Customer, type CustomerStatus } from "@prisma/client";
+import type { Customer, CustomerStatus, Prisma } from "@prisma/client";
 
 import type { CustomerSortColumn, CustomerSortDir } from "./customers.schemas";
 
