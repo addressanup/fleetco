@@ -490,4 +490,75 @@ export class TripsService {
       throw error;
     }
   }
+
+  /**
+   * Per-vehicle lifetime stats — aggregates the trip history into three
+   * scalars the Vehicle detail page surfaces in iter 12. Called by
+   * VehiclesController via `TripsModule`'s export — the aggregation
+   * lives here (next to `list` / `findById`) rather than on
+   * VehiclesService because the underlying data is Trip rows.
+   *
+   * Scope decisions (see /docs/glossary.md and the iter-11 odometer
+   * auto-update for the policy rationale):
+   *   - `completedTripCount` counts COMPLETED trips only. PLANNED and
+   *     IN_PROGRESS trips have no settled distance; CANCELLED is voided.
+   *   - `totalKmLogged` sums `endOdometerKm − startOdometerKm` across
+   *     COMPLETED trips only. Both fields are non-null on COMPLETED
+   *     rows (cross-field validation enforces it), so the subtraction
+   *     is safe; `?? 0` defends against an empty result set.
+   *   - `mostRecentDriver` is the driver on the trip with the largest
+   *     non-null `startedAt` — "who last actually drove this vehicle".
+   *     Includes IN_PROGRESS, COMPLETED, and any CANCELLED-after-start.
+   *     PLANNED trips have `startedAt = null` and are excluded.
+   *
+   * The three Prisma queries run inside a single `$transaction([...])`
+   * so the three reads see a consistent snapshot (without it, a trip
+   * COMPLETED between query 1 and query 2 could appear in the count
+   * but not the sum, or vice versa).
+   */
+  async statsForVehicle(vehicleId: string): Promise<{
+    completedTripCount: number;
+    totalKmLogged: number;
+    mostRecentDriver: {
+      id: string;
+      fullName: string;
+      tripId: string;
+      startedAt: Date;
+    } | null;
+  }> {
+    const [completedTripCount, sumAggregate, mostRecentTrip] = await this.prisma.$transaction([
+      this.prisma.trip.count({
+        where: { vehicleId, status: "COMPLETED" },
+      }),
+      this.prisma.trip.aggregate({
+        where: { vehicleId, status: "COMPLETED" },
+        _sum: { endOdometerKm: true, startOdometerKm: true },
+      }),
+      this.prisma.trip.findFirst({
+        where: { vehicleId, startedAt: { not: null } },
+        orderBy: { startedAt: "desc" },
+        select: {
+          id: true,
+          startedAt: true,
+          driver: { select: { id: true, fullName: true } },
+        },
+      }),
+    ]);
+
+    const sumEnd = sumAggregate._sum.endOdometerKm ?? 0;
+    const sumStart = sumAggregate._sum.startOdometerKm ?? 0;
+    const totalKmLogged = sumEnd - sumStart;
+
+    const mostRecentDriver =
+      mostRecentTrip && mostRecentTrip.startedAt
+        ? {
+            id: mostRecentTrip.driver.id,
+            fullName: mostRecentTrip.driver.fullName,
+            tripId: mostRecentTrip.id,
+            startedAt: mostRecentTrip.startedAt,
+          }
+        : null;
+
+    return { completedTripCount, totalKmLogged, mostRecentDriver };
+  }
 }

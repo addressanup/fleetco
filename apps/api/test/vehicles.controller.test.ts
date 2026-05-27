@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { BadRequestException, type INestApplication } from "@nestjs/common";
+import { BadRequestException, NotFoundException, type INestApplication } from "@nestjs/common";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { VehicleKind, VehicleStatus } from "@prisma/client";
+import { TripStatus, VehicleKind, VehicleStatus } from "@prisma/client";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 import { AuthGuard } from "../src/modules/auth/auth.guard";
 import { AUTH } from "../src/modules/auth/auth.tokens";
+import { DriversService } from "../src/modules/drivers/drivers.service";
 import { PrismaService } from "../src/modules/prisma/prisma.service";
+import { TripsService } from "../src/modules/trips/trips.service";
 import { VehiclesController } from "../src/modules/vehicles/vehicles.controller";
 import { VehiclesService } from "../src/modules/vehicles/vehicles.service";
 import {
@@ -164,6 +166,10 @@ describe("VehiclesController.list (integration, real Prisma)", () => {
       controllers: [VehiclesController],
       providers: [
         VehiclesService,
+        // VehiclesController gained a TripsService dep in iter 12 for
+        // the GET /:id/stats route; supply both services so DI resolves.
+        TripsService,
+        DriversService,
         PrismaService,
         // AUTH is required by AuthGuard's constructor. The override
         // below replaces the guard itself, but Nest still resolves
@@ -269,5 +275,171 @@ describe("VehiclesController.list (integration, real Prisma)", () => {
     });
     expect(response.total).toBe(3);
     expect(response.items).toHaveLength(3);
+  });
+});
+
+describe("VehiclesController.getStats (iter-12 cross-slice read)", () => {
+  // Integration coverage for GET /api/v1/vehicles/:id/stats. The
+  // service-side aggregation logic is covered in trips.service.test.ts;
+  // this block pins the controller's contract: existence check, the
+  // ISO-string serialization of mostRecentDriver.startedAt, and the
+  // basic happy / empty paths. Mirrors the test-module setup used by
+  // the iter-4 list-integration block above.
+
+  let module: TestingModule;
+  let app: INestApplication;
+  let prisma: PrismaService;
+  let controller: VehiclesController;
+  let vehiclesService: VehiclesService;
+  let driversService: DriversService;
+  let adminId: string;
+
+  beforeAll(async () => {
+    module = await Test.createTestingModule({
+      controllers: [VehiclesController],
+      providers: [
+        VehiclesService,
+        TripsService,
+        DriversService,
+        PrismaService,
+        { provide: AUTH, useValue: { api: { getSession: () => null } } },
+      ],
+    })
+      .overrideGuard(AuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
+
+    app = module.createNestApplication();
+    await app.init();
+
+    prisma = module.get(PrismaService);
+    vehiclesService = module.get(VehiclesService);
+    driversService = module.get(DriversService);
+    controller = module.get(VehiclesController);
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(async () => {
+    await resetDb(prisma);
+    adminId = `user_${randomUUID()}`;
+    await prisma.user.create({
+      data: {
+        id: adminId,
+        email: `admin-${adminId}@fleetco.test`,
+        name: "Test Admin",
+      },
+    });
+  });
+
+  test("unknown vehicle id → NotFoundException (HTTP 404)", async () => {
+    // The route checks existence via vehicles.getById before
+    // delegating to the aggregation. Without the check the response
+    // would be `{ count: 0, total: 0, mostRecentDriver: null }` for
+    // any garbage id, which would be misleading. Pinned so a refactor
+    // that drops the existence check would fail loudly.
+    try {
+      await controller.getStats("nonexistent-vehicle-id");
+      throw new Error("expected NotFoundException");
+    } catch (error) {
+      expect(error).toBeInstanceOf(NotFoundException);
+      expect((error as NotFoundException).message).toContain("nonexistent-vehicle-id");
+    }
+  });
+
+  test("vehicle with zero trips → wire shape with zeros + null driver", async () => {
+    const vehicle = await vehiclesService.create(makeCreateInput(), adminId);
+
+    const stats = await controller.getStats(vehicle.id);
+    expect(stats).toEqual({
+      vehicleId: vehicle.id,
+      completedTripCount: 0,
+      totalKmLogged: 0,
+      mostRecentDriver: null,
+    });
+  });
+
+  test("happy path → mostRecentDriver.startedAt is an ISO string (not a Date)", async () => {
+    // The service returns a Date; the controller converts to ISO for
+    // the wire. Pin this so a refactor that forwards the service
+    // shape unchanged would fail (Date.prototype.toISOString call
+    // dropped). The Drivers and Vehicles slices follow the same
+    // wire convention: dates cross the API boundary as ISO strings.
+    const vehicle = await vehiclesService.create(makeCreateInput(), adminId);
+    const driver = await driversService.create(
+      {
+        fullName: "Test Driver",
+        licenseNumber: `LIC-${randomUUID().slice(0, 8)}`,
+        licenseClass: "HMV",
+        phone: "+977-9800000000",
+        hiredAt: new Date("2022-04-01"),
+        licenseExpiresAt: new Date("2028-04-01"),
+      },
+      adminId,
+    );
+    await prisma.trip.create({
+      data: {
+        vehicleId: vehicle.id,
+        driverId: driver.id,
+        createdById: adminId,
+        status: TripStatus.IN_PROGRESS,
+        startedAt: new Date("2026-04-15T08:00:00Z"),
+        startOdometerKm: 1000,
+      },
+    });
+
+    const stats = await controller.getStats(vehicle.id);
+    expect(stats.mostRecentDriver).not.toBeNull();
+    expect(stats.mostRecentDriver?.id).toBe(driver.id);
+    expect(stats.mostRecentDriver?.fullName).toBe("Test Driver");
+    expect(typeof stats.mostRecentDriver?.startedAt).toBe("string");
+    expect(stats.mostRecentDriver?.startedAt).toBe("2026-04-15T08:00:00.000Z");
+  });
+
+  test("happy path with COMPLETED trips → completedTripCount + totalKmLogged populated", async () => {
+    const vehicle = await vehiclesService.create(makeCreateInput(), adminId);
+    const driver = await driversService.create(
+      {
+        fullName: "Other Driver",
+        licenseNumber: `LIC-${randomUUID().slice(0, 8)}`,
+        licenseClass: "HMV",
+        phone: "+977-9800000001",
+        hiredAt: new Date("2022-04-01"),
+        licenseExpiresAt: new Date("2028-04-01"),
+      },
+      adminId,
+    );
+    // Two COMPLETED trips covering 350 km combined.
+    await prisma.trip.create({
+      data: {
+        vehicleId: vehicle.id,
+        driverId: driver.id,
+        createdById: adminId,
+        status: TripStatus.COMPLETED,
+        startedAt: new Date("2026-04-10T08:00:00Z"),
+        endedAt: new Date("2026-04-10T18:00:00Z"),
+        startOdometerKm: 500,
+        endOdometerKm: 700,
+      },
+    });
+    await prisma.trip.create({
+      data: {
+        vehicleId: vehicle.id,
+        driverId: driver.id,
+        createdById: adminId,
+        status: TripStatus.COMPLETED,
+        startedAt: new Date("2026-04-12T08:00:00Z"),
+        endedAt: new Date("2026-04-12T18:00:00Z"),
+        startOdometerKm: 700,
+        endOdometerKm: 850,
+      },
+    });
+
+    const stats = await controller.getStats(vehicle.id);
+    expect(stats.completedTripCount).toBe(2);
+    expect(stats.totalKmLogged).toBe(350);
+    expect(stats.mostRecentDriver?.id).toBe(driver.id);
   });
 });

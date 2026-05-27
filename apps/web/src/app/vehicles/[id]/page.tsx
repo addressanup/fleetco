@@ -36,6 +36,26 @@ interface TripsListResponse {
 
 const RECENT_TRIPS_LIMIT = 10;
 
+// Cross-slice read — iter 12. "Lifetime stats" surfaces three scalar
+// aggregations from `GET /api/v1/vehicles/:id/stats`: count + km from
+// COMPLETED trips, plus the driver of the most-recently-started trip
+// (any non-null `startedAt`). Mirror of the API's VehicleStatsResponse
+// in apps/api/src/modules/vehicles/vehicles.controller.ts. Inlining
+// rather than shared-typing follows the same convention as
+// TripsListResponse above — promotion to a shared module waits until
+// a second surface consumes it.
+interface VehicleStatsResponse {
+  vehicleId: string;
+  completedTripCount: number;
+  totalKmLogged: number;
+  mostRecentDriver: {
+    id: string;
+    fullName: string;
+    tripId: string;
+    startedAt: string;
+  } | null;
+}
+
 // Vehicle detail — iter 3 of the Vehicles slice. Server-rendered shell
 // (auth gate via getServerSession; redirect to /login if absent); fetches
 // the vehicle via apiFetch and surfaces 404 through Next.js's notFound()
@@ -121,16 +141,22 @@ export default async function VehicleDetailPage({
     throw error;
   }
 
-  // Cross-slice read: fetch the 10 most recent trips for this vehicle.
-  // 401 → login (consistent with the primary fetch above). Any other
-  // failure is allowed to propagate; the user has already seen the
-  // vehicle, and a 5xx on the section fetch is loud enough at the
-  // error-boundary that swallowing it would be the worse outcome.
+  // Cross-slice reads: fetch the 10 most recent trips for this vehicle
+  // and the lifetime stats. The two fetches are independent and run in
+  // parallel via Promise.all; 401 on either → login (consistent with the
+  // primary fetch above). Any other failure is allowed to propagate;
+  // the user has already seen the vehicle, and a 5xx on a section fetch
+  // is loud enough at the error-boundary that swallowing it would be
+  // the worse outcome.
   let trips: TripsListResponse;
+  let stats: VehicleStatsResponse;
   try {
-    trips = await apiFetch<TripsListResponse>(
-      `/api/v1/trips?vehicleId=${encodeURIComponent(vehicle.id)}&sortBy=createdAt&sortDir=desc&take=${RECENT_TRIPS_LIMIT}`,
-    );
+    [trips, stats] = await Promise.all([
+      apiFetch<TripsListResponse>(
+        `/api/v1/trips?vehicleId=${encodeURIComponent(vehicle.id)}&sortBy=createdAt&sortDir=desc&take=${RECENT_TRIPS_LIMIT}`,
+      ),
+      apiFetch<VehicleStatsResponse>(`/api/v1/vehicles/${encodeURIComponent(vehicle.id)}/stats`),
+    ]);
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       redirect("/login");
@@ -198,6 +224,39 @@ export default async function VehicleDetailPage({
           </dl>
         </section>
 
+        {/* Iter 12: lifetime stats card. Three scalars from the new
+            GET /api/v1/vehicles/:id/stats endpoint. Most-recent-driver
+            is a link to the driver detail page when present — consistent
+            with the driver-name linking in the trips table below. */}
+        <section className="border-border-subtle bg-surface-raised rounded border p-6 shadow-sm">
+          <h2 className="text-text-muted mb-4 text-xs font-medium uppercase tracking-wide">
+            Lifetime stats
+          </h2>
+          <dl className="grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-3">
+            <DetailRow label="Completed trips" value={String(stats.completedTripCount)} numeric />
+            <DetailRow
+              label="Total km logged"
+              value={formatKilometers(stats.totalKmLogged)}
+              numeric
+            />
+            <DetailRow
+              label="Most recent driver"
+              value={
+                stats.mostRecentDriver ? (
+                  <Link
+                    href={`/drivers/${stats.mostRecentDriver.id}`}
+                    className="text-text-primary hover:text-text-secondary underline-offset-2 hover:underline"
+                  >
+                    {stats.mostRecentDriver.fullName}
+                  </Link>
+                ) : (
+                  "—"
+                )
+              }
+            />
+          </dl>
+        </section>
+
         <section className="border-border-subtle bg-surface-raised rounded border shadow-sm">
           <header className="border-border-subtle flex items-center justify-between gap-4 border-b px-6 py-4">
             <h2 className="text-text-muted text-xs font-medium uppercase tracking-wide">
@@ -259,7 +318,10 @@ export default async function VehicleDetailPage({
 
 interface DetailRowProps {
   label: string;
-  value: string;
+  // Accept ReactNode so callers can pass a <Link> (e.g., the
+  // iter-12 "Most recent driver" cell). For the common case the
+  // value is still a plain string.
+  value: React.ReactNode;
   mono?: boolean;
   numeric?: boolean;
 }
