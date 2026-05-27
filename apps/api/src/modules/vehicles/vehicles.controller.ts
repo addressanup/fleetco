@@ -18,11 +18,14 @@ import type { Vehicle } from "@prisma/client";
 import { AuthGuard } from "../auth/auth.guard";
 import type { AuthenticatedRequest } from "../auth/auth.types";
 
-// VehiclesService is injected by NestJS via emitDecoratorMetadata; the
-// class reference must remain a value import at runtime. See the matching
-// comment in health.service.ts for the rationale.
+// VehiclesService and TripsService are injected by NestJS via
+// emitDecoratorMetadata; the class references must remain value
+// imports at runtime so the DI container can resolve them. See the
+// matching comment in health.service.ts for the rationale.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { VehiclesService, DEFAULT_TAKE } from "./vehicles.service";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { TripsService } from "../trips/trips.service";
 import {
   CreateVehicleSchema,
   ListVehiclesQuerySchema,
@@ -47,6 +50,27 @@ export interface VehiclesListResponse {
   sortDir: VehicleSortDir;
 }
 
+// Iter-12 wire shape for `GET /api/v1/vehicles/:id/stats`. The route
+// surfaces three aggregations the Vehicle detail page renders in a
+// "Lifetime stats" section: count + km from COMPLETED trips, plus the
+// driver of the most-recently-started trip (any non-null `startedAt`).
+//
+// The `startedAt` field is serialized as an ISO string for the wire
+// (the service returns a `Date`); the controller does the conversion
+// in `getStats()` below. Matches the project-wide convention that
+// datetimes cross the API boundary as ISO strings.
+export interface VehicleStatsResponse {
+  vehicleId: string;
+  completedTripCount: number;
+  totalKmLogged: number;
+  mostRecentDriver: {
+    id: string;
+    fullName: string;
+    tripId: string;
+    startedAt: string;
+  } | null;
+}
+
 // Route prefix: `api/v1/vehicles`. The existing AuthController uses no
 // prefix (mounted at /me) and HealthController uses /health; a global
 // prefix would break those and the better-auth handler at /auth/{*splat}.
@@ -56,7 +80,10 @@ export interface VehiclesListResponse {
 @Controller("api/v1/vehicles")
 @UseGuards(AuthGuard)
 export class VehiclesController {
-  constructor(private readonly vehicles: VehiclesService) {}
+  constructor(
+    private readonly vehicles: VehiclesService,
+    private readonly trips: TripsService,
+  ) {}
 
   /**
    * List vehicles with filter / sort / pagination. ZodValidationPipe
@@ -101,6 +128,47 @@ export class VehiclesController {
       throw new NotFoundException(`Vehicle ${id} not found`);
     }
     return vehicle;
+  }
+
+  /**
+   * Per-vehicle lifetime stats — three scalar aggregations the
+   * Vehicle detail page surfaces in iter 12: `completedTripCount`,
+   * `totalKmLogged` (sum across COMPLETED trips), and the driver of
+   * the most-recently-started trip.
+   *
+   * Existence is checked first via `vehicles.getById` so an unknown
+   * id returns the same 404 shape as `GET /api/v1/vehicles/:id`
+   * rather than a misleading `{ count: 0, total: 0, mostRecentDriver:
+   * null }` response. The aggregation lives in TripsService (the
+   * data is Trip rows); see the service-side docstring for the scope
+   * decisions (COMPLETED-only, startedAt-not-createdAt for most-recent).
+   *
+   * The wire response serializes `mostRecentDriver.startedAt` as an
+   * ISO string; the service returns a Date. No pagination, no query
+   * params — stats are scalar.
+   */
+  @Get(":id/stats")
+  async getStats(@Param("id") id: string): Promise<VehicleStatsResponse> {
+    const vehicle = await this.vehicles.getById(id);
+    if (!vehicle) {
+      throw new NotFoundException(`Vehicle ${id} not found`);
+    }
+
+    const stats = await this.trips.statsForVehicle(id);
+
+    return {
+      vehicleId: id,
+      completedTripCount: stats.completedTripCount,
+      totalKmLogged: stats.totalKmLogged,
+      mostRecentDriver: stats.mostRecentDriver
+        ? {
+            id: stats.mostRecentDriver.id,
+            fullName: stats.mostRecentDriver.fullName,
+            tripId: stats.mostRecentDriver.tripId,
+            startedAt: stats.mostRecentDriver.startedAt.toISOString(),
+          }
+        : null,
+    };
   }
 
   /**
