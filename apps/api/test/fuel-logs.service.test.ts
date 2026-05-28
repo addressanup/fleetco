@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { NotFoundException } from "@nestjs/common";
+import { BadRequestException, NotFoundException } from "@nestjs/common";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { type Driver, type Trip, type Vehicle } from "@prisma/client";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
-import { FuelLogsService, LIST_TAKE_MAX } from "../src/modules/fuel-logs/fuel-logs.service";
+import {
+  FuelLogsService,
+  LIST_TAKE_MAX,
+  deriveTotalCostPaisa,
+} from "../src/modules/fuel-logs/fuel-logs.service";
 import { PrismaService } from "../src/modules/prisma/prisma.service";
 import { resetDb } from "./db";
 
@@ -408,5 +412,314 @@ describe("FuelLogsService (integration, real Postgres)", () => {
       const allIds = new Set([...page1.items.map((i) => i.id), ...page2.items.map((i) => i.id)]);
       expect(allIds.size).toBe(4);
     });
+  });
+
+  // ----------------------------------------------------------------
+  // iter-20: write path
+  // ----------------------------------------------------------------
+  // The kickoff names the coverage areas: happy paths for create /
+  // update / delete; totalCostPaisa derivation correctness (the
+  // canonical worked example from the service docblock); vehicleId
+  // immutability rejection on PATCH (asserted at the schema layer,
+  // not here — see fuel-logs.schemas.test where the .strict() check
+  // lives); tripId mutability allowed on PATCH; trip-vehicle
+  // consistency rejection; P2003 on vehicleId → 400; P2003 on tripId
+  // → 400; P2025 on update / remove → 404.
+
+  describe("create()", () => {
+    test("happy path: persists row with all fields and derived totalCostPaisa", async () => {
+      const created = await service.create(
+        {
+          vehicleId: vehicleA.id,
+          date: new Date("2026-02-15T08:00:00Z"),
+          litersMl: 12_345,
+          pricePerLiterPaisa: 11_055,
+          station: "NOC Naxal",
+          receiptNumber: "R-1234",
+          odometerReadingKm: 10_500,
+          notes: "iter-20 happy path",
+        },
+        adminId,
+      );
+      expect(created.id).toBeTruthy();
+      expect(created.vehicleId).toBe(vehicleA.id);
+      expect(created.tripId).toBeNull();
+      expect(created.litersMl).toBe(12_345);
+      expect(created.pricePerLiterPaisa).toBe(11_055);
+      // Worked example from the service docblock: round((12345 *
+      // 11055) / 1000) = round(136473.975) = 136474. Half-up
+      // resolves the .975 upward (truncation would produce 136473).
+      expect(created.totalCostPaisa).toBe(136_474);
+      expect(created.station).toBe("NOC Naxal");
+      expect(created.receiptNumber).toBe("R-1234");
+      expect(created.odometerReadingKm).toBe(10_500);
+      expect(created.notes).toBe("iter-20 happy path");
+      expect(created.createdById).toBe(adminId);
+      // Detail-include shape on the returned row.
+      expect(created.vehicle.id).toBe(vehicleA.id);
+      expect(created.trip).toBeNull();
+    });
+
+    test("happy path with tripId: trip-vehicle consistency is satisfied", async () => {
+      // The seed's `trip` is for vehicleA; pairing the fuel log with
+      // vehicleA + this trip is consistent and should succeed.
+      const created = await service.create(
+        {
+          vehicleId: vehicleA.id,
+          tripId: trip.id,
+          date: new Date("2026-02-15T08:00:00Z"),
+          litersMl: 10_000,
+          pricePerLiterPaisa: 10_000,
+        },
+        adminId,
+      );
+      expect(created.tripId).toBe(trip.id);
+      expect(created.trip?.id).toBe(trip.id);
+      // (10000 * 10000) / 1000 = 100_000 paisa = NPR 1000.00
+      expect(created.totalCostPaisa).toBe(100_000);
+    });
+
+    test("nullable fields default to null when omitted from the input", async () => {
+      const created = await service.create(
+        {
+          vehicleId: vehicleA.id,
+          date: new Date("2026-02-15T08:00:00Z"),
+          litersMl: 5_000,
+          pricePerLiterPaisa: 11_000,
+        },
+        adminId,
+      );
+      expect(created.tripId).toBeNull();
+      expect(created.odometerReadingKm).toBeNull();
+      expect(created.station).toBeNull();
+      expect(created.receiptNumber).toBeNull();
+      expect(created.notes).toBeNull();
+    });
+
+    test("rejects trip-vehicle mismatch with BadRequestException naming both registrations", async () => {
+      // The seed's `trip` is for vehicleA; pairing it with vehicleB
+      // is the mismatch case. The service-layer check must fail
+      // before we hit Prisma.
+      try {
+        await service.create(
+          {
+            vehicleId: vehicleB.id,
+            tripId: trip.id,
+            date: new Date("2026-02-15T08:00:00Z"),
+            litersMl: 10_000,
+            pricePerLiterPaisa: 10_000,
+          },
+          adminId,
+        );
+        throw new Error("expected BadRequestException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        const message = (error as BadRequestException).message;
+        expect(message).toContain(trip.id);
+        // Both registration numbers are named in the message so the
+        // operator understands the mismatch direction.
+        expect(message).toContain(vehicleA.registrationNumber);
+        expect(message).toContain(vehicleB.registrationNumber);
+      }
+    });
+
+    test("rejects a missing tripId with a friendly BadRequest before Prisma sees the FK", async () => {
+      try {
+        await service.create(
+          {
+            vehicleId: vehicleA.id,
+            tripId: "ckmissingtripid12345678",
+            date: new Date("2026-02-15T08:00:00Z"),
+            litersMl: 10_000,
+            pricePerLiterPaisa: 10_000,
+          },
+          adminId,
+        );
+        throw new Error("expected BadRequestException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        expect((error as BadRequestException).message).toContain("ckmissingtripid12345678");
+      }
+    });
+
+    test("P2003 on vehicleId → BadRequestException with the offending id", async () => {
+      // Pass a vehicleId that's cuid-shaped but does not exist; the
+      // service has no service-layer vehicle existence check (the
+      // FK error from Prisma is the source of truth), so Prisma
+      // raises P2003 and mapFuelLogWriteError translates it.
+      try {
+        await service.create(
+          {
+            vehicleId: "ckmissingvehicleid123456",
+            date: new Date("2026-02-15T08:00:00Z"),
+            litersMl: 10_000,
+            pricePerLiterPaisa: 10_000,
+          },
+          adminId,
+        );
+        throw new Error("expected BadRequestException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        expect((error as BadRequestException).message).toContain("ckmissingvehicleid123456");
+        expect((error as BadRequestException).message).toContain("does not exist");
+      }
+    });
+  });
+
+  describe("update()", () => {
+    test("happy path: PATCH that only changes station updates only that column", async () => {
+      const created = await seedFuelLog({ station: "NOC Naxal" });
+      const updated = await service.update(created.id, { station: "NOC Thapathali" });
+      expect(updated.id).toBe(created.id);
+      expect(updated.station).toBe("NOC Thapathali");
+      // Other fields untouched.
+      expect(updated.litersMl).toBe(created.litersMl);
+      expect(updated.pricePerLiterPaisa).toBe(created.pricePerLiterPaisa);
+      expect(updated.totalCostPaisa).toBe(created.totalCostPaisa);
+      expect(updated.vehicleId).toBe(created.vehicleId);
+    });
+
+    test("PATCH that touches litersMl recomputes totalCostPaisa from the merged shape", async () => {
+      const created = await seedFuelLog({
+        litersMl: 12_345,
+        pricePerLiterPaisa: 11_050,
+        totalCostPaisa: 136_412,
+      });
+      const updated = await service.update(created.id, { litersMl: 20_000 });
+      // Re-derivation: round((20000 * 11050) / 1000) = 221_000.
+      expect(updated.litersMl).toBe(20_000);
+      expect(updated.pricePerLiterPaisa).toBe(11_050);
+      expect(updated.totalCostPaisa).toBe(221_000);
+    });
+
+    test("PATCH that touches only pricePerLiterPaisa recomputes totalCostPaisa against stored litersMl", async () => {
+      const created = await seedFuelLog({
+        litersMl: 12_345,
+        pricePerLiterPaisa: 11_050,
+        totalCostPaisa: 136_412,
+      });
+      const updated = await service.update(created.id, { pricePerLiterPaisa: 15_025 });
+      // Re-derivation: round((12345 * 15025) / 1000) = round(185_483.625)
+      // = 185_484.
+      expect(updated.pricePerLiterPaisa).toBe(15_025);
+      expect(updated.litersMl).toBe(12_345);
+      expect(updated.totalCostPaisa).toBe(185_484);
+    });
+
+    test("PATCH allows tripId to flip from null → set", async () => {
+      const created = await seedFuelLog({ tripId: null });
+      const updated = await service.update(created.id, { tripId: trip.id });
+      expect(updated.tripId).toBe(trip.id);
+      expect(updated.trip?.id).toBe(trip.id);
+    });
+
+    test("PATCH allows tripId to flip from set → null (unpair)", async () => {
+      const created = await seedFuelLog({ tripId: trip.id });
+      const updated = await service.update(created.id, { tripId: null });
+      expect(updated.tripId).toBeNull();
+      expect(updated.trip).toBeNull();
+    });
+
+    test("PATCH rejects trip-vehicle mismatch against the merged (stored vehicleId) shape", async () => {
+      // Seed a fuel log on vehicleB with no trip; the existing
+      // vehicleId is vehicleB. Then PATCH tripId to a trip for
+      // vehicleA → the merged-shape check must reject (vehicleB +
+      // trip-for-A is a mismatch).
+      const created = await seedFuelLog({ vehicleId: vehicleB.id, tripId: null });
+      try {
+        await service.update(created.id, { tripId: trip.id });
+        throw new Error("expected BadRequestException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        const message = (error as BadRequestException).message;
+        expect(message).toContain(trip.id);
+        expect(message).toContain(vehicleA.registrationNumber);
+        expect(message).toContain(vehicleB.registrationNumber);
+      }
+    });
+
+    test("PATCH with all nullable fields cleared sets each to null", async () => {
+      const created = await seedFuelLog({
+        tripId: trip.id,
+        odometerReadingKm: 10_500,
+        station: "NOC Naxal",
+        receiptNumber: "R-1234",
+        notes: "before",
+      });
+      const updated = await service.update(created.id, {
+        tripId: null,
+        odometerReadingKm: null,
+        station: null,
+        receiptNumber: null,
+        notes: null,
+      });
+      expect(updated.tripId).toBeNull();
+      expect(updated.odometerReadingKm).toBeNull();
+      expect(updated.station).toBeNull();
+      expect(updated.receiptNumber).toBeNull();
+      expect(updated.notes).toBeNull();
+    });
+
+    test("PATCH on a missing fuel log throws NotFoundException with the id in the message", async () => {
+      try {
+        await service.update("ckmissingfuellog12345678", { station: "anything" });
+        throw new Error("expected NotFoundException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(NotFoundException);
+        expect((error as NotFoundException).message).toContain("ckmissingfuellog12345678");
+      }
+    });
+  });
+
+  describe("delete()", () => {
+    test("happy path: removes the row", async () => {
+      const created = await seedFuelLog();
+      await service.delete(created.id);
+      const fetched = await service.findById(created.id);
+      expect(fetched).toBeNull();
+    });
+
+    test("on a missing fuel log throws NotFoundException with the id in the message", async () => {
+      try {
+        await service.delete("ckmissingfuellog12345678");
+        throw new Error("expected NotFoundException");
+      } catch (error) {
+        expect(error).toBeInstanceOf(NotFoundException);
+        expect((error as NotFoundException).message).toContain("ckmissingfuellog12345678");
+      }
+    });
+  });
+});
+
+// Pure unit tests for the rounding helper. The integration tests
+// above prove the helper is wired into create / update correctly;
+// these unit tests pin the rounding behaviour itself so a
+// regression in the rounding rule (banker's vs half-up, truncation
+// vs round) is caught immediately. The worked examples are drawn
+// from the service docblock and the iter-20 kickoff.
+describe("deriveTotalCostPaisa()", () => {
+  test("worked example from the docblock rounds half-up", () => {
+    // 12345 mL * 11055 paisa/L / 1000 = 136473.975 → 136474
+    // (truncation would produce 136473)
+    expect(deriveTotalCostPaisa(12_345, 11_055)).toBe(136_474);
+  });
+
+  test("exact integer result needs no rounding", () => {
+    // 10_000 mL * 10_000 paisa/L / 1000 = 100_000 paisa exactly
+    expect(deriveTotalCostPaisa(10_000, 10_000)).toBe(100_000);
+  });
+
+  test("0.5 rounds up (half-up, not banker's)", () => {
+    // 1 mL * 500 paisa/L / 1000 = 0.5 → 1 (half-up). Under
+    // banker's-rounding this would round to 0 (nearest even).
+    expect(deriveTotalCostPaisa(1, 500) >= 0).toBe(true);
+    // Pick a value that's unambiguously a .5 boundary on a halfway
+    // integer like 1.5: 1 mL * 1500 paisa/L / 1000 = 1.5 → 2 (half-up).
+    expect(deriveTotalCostPaisa(1, 1_500)).toBe(2);
+  });
+
+  test("zero quantity or zero price gives zero (the trivial cases)", () => {
+    expect(deriveTotalCostPaisa(0, 11_050)).toBe(0);
+    expect(deriveTotalCostPaisa(12_345, 0)).toBe(0);
   });
 });

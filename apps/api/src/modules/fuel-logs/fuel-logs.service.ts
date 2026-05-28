@@ -1,7 +1,18 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
-import type { Prisma } from "@prisma/client";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { Prisma } from "@prisma/client";
 
-import type { FuelLogSortColumn, FuelLogSortDir } from "./fuel-logs.schemas";
+import type {
+  CreateFuelLogInput,
+  FuelLogSortColumn,
+  FuelLogSortDir,
+  UpdateFuelLogInput,
+} from "./fuel-logs.schemas";
+
+// Re-export the schema-inferred input types so call sites (notably
+// the controller and tests) can pull them from this module — the
+// same convention TripsService / CustomersService / JobsService
+// follow.
+export type { CreateFuelLogInput, UpdateFuelLogInput };
 
 // PrismaService is injected by NestJS via TypeScript's
 // emitDecoratorMetadata (see apps/api/tsconfig.json); the class
@@ -218,4 +229,344 @@ export class FuelLogsService {
     }
     return row;
   }
+
+  /**
+   * Create a FuelLog. `createdById` is supplied by the controller
+   * from the authenticated session, not by the client — same
+   * convention as every other write-path service. `CreateFuelLogSchema.strict()`
+   * keeps `createdById` (and `totalCostPaisa`, and any other unknown
+   * key) off the wire; the service trusts that and uses only fields
+   * from `CreateFuelLogInput`.
+   *
+   * `totalCostPaisa` is DERIVED here from `litersMl *
+   * pricePerLiterPaisa / 1000`, rounded by `Math.round` (half-up).
+   * The `/1000` converts milliliters to liters (per the
+   * money-as-minor-units rule mechanically extended to volume; see
+   * CLAUDE.md §"Money & units"). Half-up rounding matches the
+   * operator's mental model for cash receipts in Nepal and the
+   * printed pump-receipts they audit against; banker's-rounding
+   * alternatives were considered and rejected at the iter-20
+   * kickoff. See the glossary entry's "iter-20" note for the
+   * decision record.
+   *
+   * Cross-field rule (trip-vehicle consistency): when `tripId` is
+   * present, the referenced Trip's `vehicleId` MUST match this fuel
+   * log's `vehicleId`. The rationale: a fuel log paired with a trip
+   * is making a claim about which trip consumed that fuel; a trip
+   * for vehicle B cannot have consumed fuel pumped into vehicle A.
+   * The check is service-layer (not a DB constraint) — same
+   * precedent as the trip status-transition rules; the relationship
+   * is small and changes faster than schema migrations are
+   * comfortable to ship. On mismatch we throw BadRequestException
+   * with the offending registration numbers named so the operator
+   * understands the mismatch.
+   *
+   * FK validation (P2003): on a Prisma foreign-key violation, we
+   * translate to BadRequestException with a per-field message
+   * (`vehicleId` / `tripId` / `createdById`). HTTP 400 (not 409) per
+   * the runbook — FK-on-create is a client-input error (the picker
+   * referenced a deleted or invalid row), not a server-side
+   * conflict. The error object's `meta.field_name` tells us which
+   * FK; we route by lowercased substring match.
+   *
+   * Odometer monotonicity check (defer): a fuel log's
+   * odometerReadingKm should arguably be >= the previous fuel log's
+   * reading for the same vehicle. We do NOT enforce this in iter
+   * 20. Backdated corrections, replacement-odometer events (a
+   * broken odometer swap means the new reading is LOWER), and
+   * operator data-entry mistakes all push back on a hard rule. The
+   * iter that adds the per-vehicle km/L report will surface the
+   * inconsistency as a soft warning on the detail page; that's the
+   * right place for it.
+   *
+   * FUTURE(km/L report): when the per-vehicle km/L report ships,
+   * the detail page will compute the fill-to-fill delta against the
+   * previous log for the same vehicle and surface a soft warning
+   * when the current odometer < previous odometer. The warning is
+   * informational, not a hard rejection, for the reasons above.
+   */
+  async create(input: CreateFuelLogInput, createdById: string): Promise<FuelLogDetail> {
+    // Service-layer cross-field check before we even attempt the
+    // insert: if the operator picked a trip that's for a different
+    // vehicle, fail fast with a clear message naming both
+    // registration numbers. We need a DB lookup of both the trip
+    // and the vehicle, so the check lives here rather than in the
+    // Zod schema.
+    if (input.tripId) {
+      await this.assertTripBelongsToVehicle(input.tripId, input.vehicleId);
+    }
+
+    // Derive totalCostPaisa from the request. See the rounding
+    // rationale in the docblock above and CLAUDE.md §"Money & units".
+    const totalCostPaisa = deriveTotalCostPaisa(input.litersMl, input.pricePerLiterPaisa);
+
+    const data: Prisma.FuelLogUncheckedCreateInput = {
+      vehicleId: input.vehicleId,
+      tripId: input.tripId ?? null,
+      date: input.date,
+      litersMl: input.litersMl,
+      pricePerLiterPaisa: input.pricePerLiterPaisa,
+      totalCostPaisa,
+      odometerReadingKm: input.odometerReadingKm ?? null,
+      station: input.station ?? null,
+      receiptNumber: input.receiptNumber ?? null,
+      notes: input.notes ?? null,
+      createdById,
+    };
+
+    try {
+      return await this.prisma.fuelLog.create({ data, include: DETAIL_INCLUDE });
+    } catch (error) {
+      throw mapFuelLogWriteError(error, {
+        vehicleId: input.vehicleId,
+        tripId: input.tripId ?? null,
+        createdById,
+      });
+    }
+  }
+
+  /**
+   * Diff-PATCH a FuelLog. Mirrors JobsService.update / CustomersService.update
+   * in shape:
+   *
+   *   1. Fetch the existing row (404 if missing, surfaced as
+   *      NotFoundException). We need the existing row to compute
+   *      the merged litersMl / pricePerLiterPaisa for the
+   *      totalCostPaisa re-derivation and for the trip-vehicle
+   *      consistency check.
+   *
+   *   2. If `tripId` is present in the PATCH (including explicit
+   *      null), re-run the trip-vehicle consistency check against
+   *      the MERGED shape (the patch's tripId paired with the
+   *      EXISTING row's vehicleId — vehicleId is immutable on
+   *      PATCH and so the existing value is the right comparison).
+   *
+   *   3. If either `litersMl` or `pricePerLiterPaisa` is present
+   *      in the PATCH, recompute totalCostPaisa against the merged
+   *      shape (current row + patch). A PATCH that touches only
+   *      `pricePerLiterPaisa` re-derives totalCostPaisa against the
+   *      stored `litersMl`. Same rounding rule as create — see
+   *      `deriveTotalCostPaisa`.
+   *
+   *   4. Let Prisma do the write. P2003 → BadRequestException
+   *      (only tripId can flip from null to non-null on PATCH;
+   *      vehicleId is rejected at the schema layer). P2025 →
+   *      NotFoundException (rare; only if a concurrent DELETE
+   *      landed between step 1 and the update).
+   *
+   * Returns the fuel log's DETAIL_INCLUDE shape so the controller
+   * can respond with the same shape that GET /api/v1/fuel-logs/:id
+   * returns.
+   *
+   * `vehicleId` is not accepted by UpdateFuelLogSchema (the
+   * `.strict()` + absence-from-shape rejects it). See the schema's
+   * docblock and the iter-20 kickoff for the immutability
+   * rationale.
+   */
+  async update(id: string, input: UpdateFuelLogInput): Promise<FuelLogDetail> {
+    const existing = await this.prisma.fuelLog.findUnique({ where: { id } });
+    if (!existing) {
+      throw new NotFoundException(`Fuel log ${id} not found`);
+    }
+
+    const has = (key: keyof UpdateFuelLogInput): boolean =>
+      Object.prototype.hasOwnProperty.call(input, key);
+
+    // Trip-vehicle consistency on the merged shape. vehicleId is
+    // immutable on PATCH so the comparison value is the existing
+    // row's vehicleId. tripId may be set, changed, or cleared
+    // (nulled) on PATCH; we re-validate only when it's touched and
+    // the new value is non-null (a null pairing has nothing to
+    // mismatch against).
+    if (has("tripId") && input.tripId) {
+      await this.assertTripBelongsToVehicle(input.tripId, existing.vehicleId);
+    }
+
+    // Recompute totalCostPaisa whenever either factor is touched.
+    // Same rounding rule as create. Documented at
+    // deriveTotalCostPaisa and on the schema's UpdateFuelLogSchema
+    // docblock.
+    let totalCostPaisaPatch: number | undefined;
+    if (has("litersMl") || has("pricePerLiterPaisa")) {
+      const mergedLitersMl = has("litersMl")
+        ? (input.litersMl ?? existing.litersMl)
+        : existing.litersMl;
+      const mergedPricePerLiterPaisa = has("pricePerLiterPaisa")
+        ? (input.pricePerLiterPaisa ?? existing.pricePerLiterPaisa)
+        : existing.pricePerLiterPaisa;
+      totalCostPaisaPatch = deriveTotalCostPaisa(mergedLitersMl, mergedPricePerLiterPaisa);
+    }
+
+    const data: Prisma.FuelLogUpdateInput = {
+      ...(has("tripId") && {
+        trip: input.tripId ? { connect: { id: input.tripId } } : { disconnect: true },
+      }),
+      ...(has("date") && input.date !== undefined && { date: input.date }),
+      ...(has("litersMl") && input.litersMl !== undefined && { litersMl: input.litersMl }),
+      ...(has("pricePerLiterPaisa") &&
+        input.pricePerLiterPaisa !== undefined && {
+          pricePerLiterPaisa: input.pricePerLiterPaisa,
+        }),
+      ...(totalCostPaisaPatch !== undefined && { totalCostPaisa: totalCostPaisaPatch }),
+      ...(has("odometerReadingKm") && { odometerReadingKm: input.odometerReadingKm ?? null }),
+      ...(has("station") && { station: input.station ?? null }),
+      ...(has("receiptNumber") && { receiptNumber: input.receiptNumber ?? null }),
+      ...(has("notes") && { notes: input.notes ?? null }),
+    };
+
+    try {
+      return await this.prisma.fuelLog.update({
+        where: { id },
+        data,
+        include: DETAIL_INCLUDE,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+        // Either the FuelLog row vanished between the findUnique
+        // and the update (rare; concurrent DELETE) or — if the
+        // PATCH disconnected and reconnected to a now-deleted trip
+        // — a related-record check failed. Either way the right
+        // response is 404 on the FuelLog itself; the trip case is
+        // additionally guarded by assertTripBelongsToVehicle above
+        // which would have surfaced a 400 first.
+        throw new NotFoundException(`Fuel log ${id} not found`);
+      }
+      throw mapFuelLogWriteError(error, {
+        vehicleId: existing.vehicleId,
+        tripId: input.tripId ?? null,
+      });
+    }
+  }
+
+  /**
+   * Hard delete a FuelLog. P2025 (delete targets a non-existent
+   * row) maps to NotFoundException.
+   *
+   * FuelLog has no inbound FKs from other aggregates in Phase 1
+   * (no other model FK-references it under `onDelete: Restrict`),
+   * so the delete path has no 409-delete-blocker branch today. A
+   * future Reports v1 aggregate may materialize per-fill summaries;
+   * if any of those add an FK to FuelLog under Restrict, this
+   * method will gain the same P2003 → ConflictException treatment
+   * the Customer / Vehicle deletes have today.
+   *
+   * Returns void on success; the controller responds 204 No
+   * Content.
+   */
+  async delete(id: string): Promise<void> {
+    try {
+      await this.prisma.fuelLog.delete({ where: { id } });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+        throw new NotFoundException(`Fuel log ${id} not found`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Look up the trip and assert its `vehicleId` matches the
+   * supplied one. Throws BadRequestException with both registration
+   * numbers named on mismatch, and a generic "trip not found"
+   * BadRequest on a missing trip (the Prisma FK would also catch a
+   * missing trip on insert as P2003, but surfacing the
+   * service-layer check up front makes the error message friendlier
+   * — the operator sees "Trip <id> not found" instead of "Trip
+   * <id> does not exist" with a stale-FK framing).
+   *
+   * The trip lookup pulls the vehicle's registrationNumber via a
+   * nested select so the error message can name it; if the trip's
+   * vehicle is missing somehow (it shouldn't be — Trip.vehicleId
+   * is NOT NULL and Vehicle deletes are Restrict-blocked), we fall
+   * back to ids.
+   */
+  private async assertTripBelongsToVehicle(tripId: string, vehicleId: string): Promise<void> {
+    const trip = await this.prisma.trip.findUnique({
+      where: { id: tripId },
+      select: {
+        id: true,
+        vehicleId: true,
+        vehicle: { select: { registrationNumber: true } },
+      },
+    });
+    if (!trip) {
+      throw new BadRequestException(`Trip ${tripId} does not exist.`);
+    }
+    if (trip.vehicleId !== vehicleId) {
+      const thisVehicle = await this.prisma.vehicle.findUnique({
+        where: { id: vehicleId },
+        select: { registrationNumber: true },
+      });
+      const tripRegistration = trip.vehicle?.registrationNumber ?? trip.vehicleId;
+      const thisRegistration = thisVehicle?.registrationNumber ?? vehicleId;
+      throw new BadRequestException(
+        `Trip ${tripId} is for vehicle ${tripRegistration}, not vehicle ${thisRegistration}.`,
+      );
+    }
+  }
+}
+
+/**
+ * Derive the fuel-log totalCostPaisa from litersMl and
+ * pricePerLiterPaisa. Same rounding rule (half-up via `Math.round`)
+ * used by both `create` and `update`. See CLAUDE.md §"Money &
+ * units" and the glossary's Fuel-log "iter-20" note for the
+ * rationale; the `/1000` converts milliliters to liters.
+ *
+ * Worked example: 12345 mL * 11055 paisa/L / 1000 = 136473.975 →
+ * `Math.round` → 136474 paisa = NPR 1364.74. Half-up resolves
+ * `.975` upward; truncation (the wrong rule) would produce 136473.
+ * The iter-19 seed pre-computed by truncated integer arithmetic
+ * (12345 * 11050 / 1000 = 136412); the iter-20 derivation is the
+ * new authoritative value and the seed is left untouched in the
+ * read-path tests because those rows are inserted directly via
+ * Prisma rather than through this service.
+ *
+ * Half-up rounding (rather than banker's, which would round 0.5
+ * toward even) matches the operator's mental model for cash
+ * receipts in Nepal and the printed pump-receipts they audit
+ * against. A future iter that introduces a per-station price-list
+ * with declared rounding policy can revisit this; for Phase 1 the
+ * half-up rule is the right operational choice.
+ */
+export function deriveTotalCostPaisa(litersMl: number, pricePerLiterPaisa: number): number {
+  return Math.round((litersMl * pricePerLiterPaisa) / 1000);
+}
+
+/**
+ * Translate a Prisma write error into a domain-level exception. The
+ * iter-20 kickoff §"FK validation mapping" calls for P2003 on
+ * `vehicleId` or `tripId` to surface as HTTP 400 with the offending
+ * id named verbatim in the message; the (service-side) controller
+ * test asserts the format. Unknown FK names fall back to a generic
+ * 400 that names the vehicleId (the more common picker error).
+ *
+ * Errors that aren't recognized propagate unchanged so NestJS's
+ * default exception filter can map them to 500.
+ */
+function mapFuelLogWriteError(
+  error: unknown,
+  context: { vehicleId: string; tripId: string | null; createdById?: string },
+): unknown {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
+    const meta = error.meta as { field_name?: string; constraint?: string } | undefined;
+    const fieldName = String(meta?.field_name ?? meta?.constraint ?? "").toLowerCase();
+    if (fieldName.includes("trip")) {
+      return new BadRequestException(`Trip ${context.tripId ?? "?"} does not exist.`);
+    }
+    if (fieldName.includes("createdby") && context.createdById) {
+      return new BadRequestException(
+        `Authenticated user "${context.createdById}" no longer exists; sign in again.`,
+      );
+    }
+    if (fieldName.includes("vehicle")) {
+      return new BadRequestException(`Vehicle ${context.vehicleId} does not exist.`);
+    }
+    // Unknown FK name — the controller-side common case is a stale
+    // vehicleId on the picker, so we name vehicleId as the
+    // generic fallback. The web action layer parses the message to
+    // route to the right field on the form.
+    return new BadRequestException(`Vehicle ${context.vehicleId} does not exist.`);
+  }
+  return error;
 }
