@@ -1,10 +1,12 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api";
 import { CUSTOMER_STATUS_LABELS } from "@/lib/customers-schema";
 import { getServerSession } from "@/lib/session";
 
+import { DeleteJobDialog } from "./delete-job-dialog";
 import { JOB_STATUS_LABELS, type JobDetail } from "../types";
 
 // Job detail — iter 17 of the Jobs slice (read path). Server-rendered
@@ -90,8 +92,16 @@ export default async function JobDetailPage({
               {job.customer.name} · {statusLabel}
             </p>
           </div>
-          {/* Iter 17 ships the read path; the Edit / Cancel CTAs land
-              with the iter-18 write path. */}
+          {/* Edit + Delete CTAs land with the iter-18 write path —
+              mirror of the Customers / Drivers / Vehicles header
+              cluster. The dialog is its own client island so the page
+              stays a Server Component. */}
+          <div className="flex items-center gap-2">
+            <Button asChild variant="outline">
+              <Link href={`/jobs/${job.id}/edit`}>Edit</Link>
+            </Button>
+            <DeleteJobDialog id={job.id} jobNumber={job.jobNumber} />
+          </div>
         </header>
 
         <section className="border-border-subtle bg-surface-raised rounded border p-6 shadow-sm">
