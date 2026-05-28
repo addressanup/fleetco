@@ -19,23 +19,24 @@ datasource db {
 // Triple-slash comments surface as JSDoc on the generated Prisma client.
 
 model User {
-  id               String     @id
+  id                 String       @id
   /// Tier 2 PII per ADR-0013 — excluded from default logging (pino redact covers *.email).
-  email            String     @unique
-  emailVerified    Boolean    @default(false)
+  email              String       @unique
+  emailVerified      Boolean      @default(false)
   /// Tier 2 PII per ADR-0013 — admin display name.
-  name             String
-  image            String?
-  createdAt        DateTime   @default(now())
-  updatedAt        DateTime   @updatedAt
-  sessions         Session[]
-  accounts         Account[]
-  vehiclesCreated  Vehicle[]  @relation("VehicleCreatedBy")
-  driversCreated   Driver[]   @relation("DriverCreatedBy")
-  tripsCreated     Trip[]     @relation("TripCreatedBy")
-  customersCreated Customer[] @relation("CustomerCreatedBy")
-  jobsCreated      Job[]      @relation("JobCreatedBy")
-  fuelLogsCreated  FuelLog[]  @relation("FuelLogCreatedBy")
+  name               String
+  image              String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  sessions           Session[]
+  accounts           Account[]
+  vehiclesCreated    Vehicle[]    @relation("VehicleCreatedBy")
+  driversCreated     Driver[]     @relation("DriverCreatedBy")
+  tripsCreated       Trip[]       @relation("TripCreatedBy")
+  customersCreated   Customer[]   @relation("CustomerCreatedBy")
+  jobsCreated        Job[]        @relation("JobCreatedBy")
+  fuelLogsCreated    FuelLog[]    @relation("FuelLogCreatedBy")
+  expenseLogsCreated ExpenseLog[] @relation("ExpenseLogCreatedBy")
 
   @@map("user")
 }
@@ -196,8 +197,9 @@ model Vehicle {
   createdById String
   createdBy   User     @relation("VehicleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
-  trips    Trip[]    @relation("TripVehicle")
-  fuelLogs FuelLog[]
+  trips       Trip[]       @relation("TripVehicle")
+  fuelLogs    FuelLog[]
+  expenseLogs ExpenseLog[]
 
   @@index([status])
   @@index([kind])
@@ -386,7 +388,8 @@ model Trip {
   createdById     String
   createdBy       User       @relation("TripCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
-  fuelLogs FuelLog[]
+  fuelLogs    FuelLog[]
+  expenseLogs ExpenseLog[]
 
   @@index([status])
   @@index([vehicleId])
@@ -483,7 +486,7 @@ model Customer {
   // by other records." message the runbook commits to is now reachable
   // end-to-end via the apps/api/test/customers-delete-blocker.test.ts
   // integration test.
-  jobs          Job[]
+  jobs Job[]
 
   @@index([status])
   @@index([createdById])
@@ -532,7 +535,7 @@ enum JobStatus {
 }
 
 model Job {
-  id          String    @id @default(cuid())
+  id                 String    @id @default(cuid())
   /// Human-readable job number in the form `JOB-YYYY-NNNNN` (e.g.
   /// `JOB-2026-00001`). Unique across the system so two jobs cannot
   /// share a number. The generator lives at the service layer in
@@ -543,22 +546,22 @@ model Job {
   /// (mirror of Customers' PAN-conflict shape from iter 16); the
   /// translation will land in JobsService.create on the iter-18 write
   /// path.
-  jobNumber   String    @unique
+  jobNumber          String    @unique
   /// FK to Customer. Indexed individually so list filters by customerId
   /// (the "jobs for this customer" UI query) hit an index. onDelete:
   /// Restrict per ADR-0003 — orphaning a job from its customer would
   /// silently corrupt per-customer billing later. This FK is the
   /// reason CustomersService.delete's P2003 → 409 branch becomes live
   /// in iter 17.
-  customerId  String
-  customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customerId         String
+  customer           Customer  @relation(fields: [customerId], references: [id], onDelete: Restrict)
   /// Tier 3 per ADR-0013 — free-form description of the work to be
   /// performed (e.g. "Haul aggregate from Kalimati to Pokhara site").
   /// Operators type the scope-of-work in plain text; structured
   /// breakdowns are a Phase 2+ concern. ≤2048 chars enforced at the
   /// schema/zod layer.
-  description String
-  status      JobStatus @default(PLANNED)
+  description        String
+  status             JobStatus @default(PLANNED)
   /// Planned start date (when the customer expects work to begin).
   /// Nullable because a job can be booked before a firm date is set.
   /// ISO/UTC per CLAUDE.md; BS-calendar rendering lands with the
@@ -705,4 +708,132 @@ model FuelLog {
   @@index([date(sort: Desc)])
   @@index([createdById])
   @@map("fuel_log")
+}
+
+// Expense logs module. Owned by apps/api/src/modules/expense-logs/ per
+// ADR-0001. Seventh Phase 1 vertical slice per the roadmap. An
+// ExpenseLog is a record of a non-fuel monetary outflow attributable
+// to fleet operations — a tyre change, a toll payment, a parking
+// charge, a quarterly insurance premium, a traffic fine. It is the
+// second money-bearing aggregate (FuelLog is the first) and so reuses
+// the integer-paisa convention from CLAUDE.md §"Money & units" rather
+// than introducing a parallel "amount as decimal" path.
+//
+// Iter 21 ships the read path only (schema + migration, list/detail
+// API, list/detail UI, tests). Iter 22 layers the write path on top
+// (POST/PATCH/DELETE + create/edit/delete UI). Same staging pattern
+// Vehicles iter-1/iter-2, Drivers iter-6/iter-7, Trips iter-8/iter-9,
+// Customers iter-15/iter-16, Jobs iter-17/iter-18, and Fuel logs
+// iter-19/iter-20 followed.
+//
+// Tier annotations per ADR-0013: expense-log records are Tier 1
+// (operational data carrying money). `vendor` (the shop / mechanic /
+// toll booth name), `receiptNumber`, and `notes` are all low-Tier —
+// they carry operational data (vendor identity, paper-receipt
+// references, "tyre rotated front-left" remarks) rather than PII or
+// auth secrets. If operators start using `notes` for contact
+// information, the redact list under ADR-0013 may need a follow-up
+// entry; the glossary entry surfaces that contingency. No new pino
+// redact entries are added by iter 21.
+//
+// FK delete policy:
+//   - vehicleId — NULLABLE, onDelete: Restrict per ADR-0003. The
+//     nullability is the key design difference from FuelLog: an
+//     expense like the company's quarterly insurance premium is not
+//     attributable to one vehicle, and the CEO records it here
+//     rather than in a separate "company expense" table. A nullable
+//     vehicleId lets the same endpoint serve both the per-vehicle
+//     cost-report query (`?vehicleId=<id>`) and the global expense
+//     feed (no filter). The iter-23 cost report will treat null
+//     vehicleId as a separate bucket. When set, Restrict prevents a
+//     vehicle delete from orphaning expense-history rows.
+//   - tripId — NULLABLE, onDelete: Restrict. Same nullability
+//     rationale as Fuel logs: an expense may or may not be paired
+//     with a specific trip (a routine maintenance bill is not tied
+//     to one trip; a toll paid mid-trip is). Restrict on the set
+//     case protects per-trip cost reporting downstream.
+//   - createdById — onDelete: Restrict, same audit-chain rationale
+//     as every other createdBy FK in the schema.
+
+/// Expense categories the CEO uses on paper today. Eight values
+/// chosen because the existing handwritten expense ledger uses these
+/// same categories; `OTHER` is the catch-all for genuine outliers
+/// that do not fit elsewhere. Free-form category strings were
+/// rejected at the iter-21 kickoff because they devolve into "Toll" /
+/// "toll" / "TOLL" / "toll booth" variants of the same fact in the
+/// database. If a ninth category emerges in practice, we add it as a
+/// migration in a single line — the cost of an enum-add migration is
+/// small. Documented in docs/glossary.md.
+enum ExpenseCategory {
+  MAINTENANCE
+  REPAIR
+  TOLL
+  PARKING
+  INSURANCE
+  PERMIT
+  FINE
+  OTHER
+
+  @@map("expense_category")
+}
+
+model ExpenseLog {
+  id            String          @id @default(cuid())
+  /// Nullable FK to Vehicle. A vehicle-agnostic expense (office
+  /// stationery, the company's quarterly insurance premium) is a
+  /// valid row with null vehicleId — same model docstring rationale.
+  /// When set, onDelete: Restrict per ADR-0003 protects per-vehicle
+  /// cost reporting. Indexed individually so list filters by
+  /// vehicleId (the "expenses for this vehicle" UI query, exposed
+  /// via the iter-21 list toolbar's text input and the future
+  /// iter-23 cost report's deep-link) hit an index.
+  vehicleId     String?
+  vehicle       Vehicle?        @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  /// Nullable FK to Trip. Same nullability rationale as Fuel logs —
+  /// an expense may or may not be paired with a specific trip. When
+  /// set, onDelete: Restrict per ADR-0003.
+  tripId        String?
+  trip          Trip?           @relation(fields: [tripId], references: [id], onDelete: Restrict)
+  /// When the expense was incurred (UTC). Indexed `(date desc)` for
+  /// the default list sort ("most recent expenses first"). ISO/UTC
+  /// per CLAUDE.md; BS-calendar rendering arrives with the future
+  /// <NepaliDate> component.
+  date          DateTime
+  /// Category bucket. See the ExpenseCategory enum docstring for
+  /// the rationale behind the eight-value choice. Indexed so the
+  /// list endpoint's `?category=<value>` filter hits an index.
+  category      ExpenseCategory
+  /// Amount in paisa (1 NPR = 100 paisa). Always integer minor
+  /// units per CLAUDE.md §"Money & units". The display formatter
+  /// renders e.g. 250000 paisa as "Rs. 2,500.00".
+  amountPaisa   Int
+  /// Vendor / payee — the shop, mechanic, toll booth, government
+  /// office, or insurer who received the payment. Nullable; a
+  /// genuine "unknown vendor" case exists when the operator is
+  /// reconciling a bank statement against incomplete receipts.
+  /// Tier 1 operational data — not PII per the glossary's caveat.
+  vendor        String?
+  /// Optional paper-receipt identifier. Nullable; not every
+  /// expense has a receipt scan and the operator may key only the
+  /// totals from a bank statement.
+  receiptNumber String?
+  /// Free-form operator notes. Tier 1 operational data today
+  /// (see the model comment above for the contingency note).
+  /// Nullable; the empty case is null rather than "".
+  notes         String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  /// References the User who created the expense-log record
+  /// (ADR-0021 admin user). Audit field; Restrict because the
+  /// expense-log's audit chain should remain intact for the row's
+  /// lifetime.
+  createdById   String
+  createdBy     User            @relation("ExpenseLogCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([vehicleId])
+  @@index([tripId])
+  @@index([category])
+  @@index([date(sort: Desc)])
+  @@index([createdById])
+  @@map("expense_log")
 }
