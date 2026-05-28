@@ -328,9 +328,11 @@ export default async function JobsPage({
                 : `${data.total} on file.`}
             </p>
           </div>
-          {/* No "New job" CTA in iter 17 (read path). Iter 18's write
-              path adds it (mirror of the Customers iter-15 → iter-16
-              header change). */}
+          {/* "New job" CTA wired in iter 18 (write path) — mirror of
+              the Customers iter-15 → iter-16 header change. */}
+          <Button asChild>
+            <Link href="/jobs/new">New job</Link>
+          </Button>
         </header>
 
         <JobsFilters status={status} />
@@ -341,9 +343,17 @@ export default async function JobsPage({
               {hasActiveFilter ? (
                 <p>No jobs match the current filters.</p>
               ) : (
-                // iter 18 turns "Book the first job." into a /jobs/new
-                // link; in the read-only iter it's plain copy.
-                <p>No jobs on file. Book the first job.</p>
+                // iter 18 wires "Book the first job." to /jobs/new.
+                <p>
+                  No jobs on file.{" "}
+                  <Link
+                    href="/jobs/new"
+                    className="text-text-primary hover:text-text-secondary underline underline-offset-4"
+                  >
+                    Book the first job
+                  </Link>
+                  .
+                </p>
               )}
             </div>
           ) : (
