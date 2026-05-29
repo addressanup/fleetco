@@ -38,6 +38,20 @@ export const SLI_LATENCY_BUDGET_MS = 500;
 export const SLI_API_AVAILABILITY = "api_availability";
 
 /**
+ * The value of the `sli` field tagging a trip-creation-success signal (ADR-0011
+ * SLI #2). `TripsController.create` (T_SLI2) wraps the create operation in
+ * try/catch and logs one line per attempt carrying this tag plus `sli_good`
+ * (true on success, false on a thrown-and-rethrown error) and, on failure,
+ * `error_kind` (the exception's class name only — never `err.message`, which
+ * the trips FK errors embed the literal vehicle/driver id into per ADR-0013).
+ * A future 28-day report filters log lines where `sli === "trip_creation_success"`
+ * and computes the SLI as the share with `sli_good === true`. The constant lives
+ * here, alongside the API-availability vocabulary, so the controller tags the
+ * signal from one shared source rather than a hard-coded string literal.
+ */
+export const SLI_TRIP_CREATION_SUCCESS = "trip_creation_success";
+
+/**
  * The structured per-request signal merged onto a request-completion log line.
  * A future 28-day report filters log lines where `sli === "api_availability"`
  * and computes the SLI as the share with `sli_good === true`.

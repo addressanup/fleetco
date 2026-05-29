@@ -1,7 +1,8 @@
 import { BadRequestException, NotFoundException, type INestApplication } from "@nestjs/common";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { TripStatus, type Vehicle, type Driver } from "@prisma/client";
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { Logger } from "nestjs-pino";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ZodValidationPipe } from "../src/common/zod-validation.pipe";
 import { AuthGuard } from "../src/modules/auth/auth.guard";
@@ -165,6 +166,10 @@ describe("TripsController.list / getById (integration, real Prisma)", () => {
         // its dependencies — provide a benign stub so DI does not
         // fail on AUTH lookup.
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
+        // TripsController injects nestjs-pino's Logger (T_SLI2). This module
+        // does not import LoggerModule, so bind a no-op fake to the Logger
+        // token; this block exercises list/getById and never asserts on it.
+        { provide: Logger, useValue: { log: () => undefined } },
       ],
     })
       .overrideGuard(AuthGuard)
@@ -489,6 +494,15 @@ describe("TripsController.create / update / remove (integration, real Prisma)", 
   // BadRequest paths, and the side effects (DB row created / updated /
   // removed).
 
+  // T_SLI2: spy on the injected nestjs-pino Logger so the trip-creation-
+  // success SLI signal can be asserted level-independently. Tests run at
+  // LOG_LEVEL=fatal, so capturing emitted stdout would see nothing —
+  // asserting against the spy is the reliable seam. The fake is a typed
+  // partial (the controller only ever calls `.log`) bound to the Logger
+  // token below; logSpy is cleared in beforeEach for per-test isolation.
+  const logSpy = vi.fn();
+  const fakeLogger: Pick<Logger, "log"> = { log: logSpy };
+
   let module: TestingModule;
   let app: INestApplication;
   let prisma: PrismaService;
@@ -506,6 +520,9 @@ describe("TripsController.create / update / remove (integration, real Prisma)", 
         TripsService,
         PrismaService,
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
+        // T_SLI2: TripsController injects nestjs-pino's Logger; bind the
+        // spy-backed fake so create()'s SLI signal can be asserted.
+        { provide: Logger, useValue: fakeLogger },
       ],
     })
       .overrideGuard(AuthGuard)
@@ -525,6 +542,7 @@ describe("TripsController.create / update / remove (integration, real Prisma)", 
   });
 
   beforeEach(async () => {
+    logSpy.mockClear();
     await resetDb(prisma);
     adminId = await seedUser(prisma);
     vehicle = await seedVehicle(prisma, adminId);
@@ -585,6 +603,66 @@ describe("TripsController.create / update / remove (integration, real Prisma)", 
       expect(error).toBeInstanceOf(BadRequestException);
       expect((error as BadRequestException).message.toLowerCase()).toContain("vehicle");
     }
+  });
+
+  test("create() success emits the trip-creation-success SLI signal (sli_good:true, no error_kind)", async () => {
+    // T_SLI2: a successful create logs exactly one structured signal tagged
+    // with the shared `sli` vocabulary and sli_good:true. The signal is the
+    // numerator+denominator a future 28-day report aggregates (ADR-0011).
+    await controller.create(
+      {
+        vehicleId: vehicle.id,
+        driverId: driver.id,
+        status: TripStatus.PLANNED,
+      },
+      fakeRequest,
+    );
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ sli: "trip_creation_success", sli_good: true }),
+    );
+    // The success line carries no error_kind — that field is failure-only.
+    const logged: unknown = logSpy.mock.calls.at(-1)?.[0];
+    expect(logged).not.toHaveProperty("error_kind");
+  });
+
+  test("create() failure (unknown vehicleId): logs sli_good:false + error_kind, still throws, leaks neither id nor message", async () => {
+    // Same stale-FK path as the test above, now asserting the SLI side effect
+    // AND that the HTTP behavior is unchanged: the catch arm rethrows, so the
+    // service's P2003 → BadRequestException still surfaces to the caller.
+    try {
+      await controller.create(
+        {
+          vehicleId: "nonexistent-vehicle",
+          driverId: driver.id,
+          status: TripStatus.PLANNED,
+        },
+        fakeRequest,
+      );
+      throw new Error("expected BadRequestException");
+    } catch (error) {
+      expect(error).toBeInstanceOf(BadRequestException);
+    }
+
+    // error_kind is the exception's CLASS NAME only (the service maps a stale
+    // FK to BadRequestException) — never err.message.
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sli: "trip_creation_success",
+        sli_good: false,
+        error_kind: "BadRequestException",
+      }),
+    );
+
+    // No-leak contract (ADR-0013): the trips service embeds the literal
+    // vehicle id in its message (`Vehicle "nonexistent-vehicle" does not
+    // exist.`). The emitted signal must contain NEITHER that id / message
+    // fragment NOR the driver id — only the Tier-4 class-name string.
+    const logged: unknown = logSpy.mock.calls.at(-1)?.[0];
+    const serialized = JSON.stringify(logged);
+    expect(serialized).not.toContain("nonexistent-vehicle");
+    expect(serialized).not.toContain("does not exist");
+    expect(serialized).not.toContain(driver.id);
   });
 
   test("update() returns the updated trip on success", async () => {
