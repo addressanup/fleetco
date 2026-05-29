@@ -1,6 +1,6 @@
 # ADR-0014: Production deployment — single VPS with Docker Compose, Caddy reverse proxy, and offsite encrypted backups
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-29
 - **Decider:** Product owner (CEO)
 
