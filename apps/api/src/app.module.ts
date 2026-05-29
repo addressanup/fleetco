@@ -4,6 +4,7 @@ import { ConfigModule } from "@nestjs/config";
 import { LoggerModule } from "nestjs-pino";
 
 import { env } from "./config/env";
+import { otelTraceMixin } from "./observability/otel";
 import { AuthModule } from "./modules/auth/auth.module";
 import { CustomersModule } from "./modules/customers/customers.module";
 import { DriversModule } from "./modules/drivers/drivers.module";
@@ -31,6 +32,11 @@ import { VehiclesModule } from "./modules/vehicles/vehicles.module";
           res.setHeader("x-request-id", id);
           return id;
         },
+        // Correlate every log line with the active OpenTelemetry trace
+        // (ADR-0024 commitment 5): injects trace_id / span_id when a valid
+        // span is active, {} otherwise. Complements genReqId's per-process
+        // request id; it does not replace it.
+        mixin: otelTraceMixin,
         redact: {
           paths: [
             "req.headers.authorization",
