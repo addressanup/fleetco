@@ -7,14 +7,30 @@ import { toNodeHandler } from "better-auth/node";
 
 import { AppModule } from "./app.module";
 import { env } from "./config/env";
+import { buildOtlpSpanProcessors } from "./observability/otel";
 import { AUTH } from "./modules/auth/auth.tokens";
 import type { AuthInstance } from "./modules/auth/auth";
 
 async function bootstrap(): Promise<void> {
-  if (env.SENTRY_DSN) {
+  // Sentry/OpenTelemetry init stays at the very top of bootstrap(), before
+  // NestFactory.create and above the better-auth mount: the ADR-0021
+  // body-parser ordering is load-bearing and this block must not be
+  // reordered into it. Sentry v9 owns the global OpenTelemetry
+  // TracerProvider and auto-instruments HTTP, Prisma and Redis; we EXTEND
+  // it with an env-gated OTLP span processor (ADR-0024 commitment 1) rather
+  // than standing up a second NodeSDK. Init when EITHER signal is set:
+  // SENTRY_DSN ships errors to Sentry, OTEL_EXPORTER_OTLP_ENDPOINT exports
+  // spans to a collector, and each runs without the other — dsn: undefined
+  // keeps the OpenTelemetry setup live with Sentry ingest off (commitment 6).
+  if (env.SENTRY_DSN || env.OTEL_EXPORTER_OTLP_ENDPOINT) {
     Sentry.init({
       dsn: env.SENTRY_DSN,
       environment: env.NODE_ENV,
+      // Additional OTLP/HTTP span processor, present only when the endpoint
+      // is set ([] otherwise, a no-op). Nothing is added for HTTP/Prisma/
+      // Redis — Sentry's default integrations already cover them (ADR-0024
+      // commitments 2 & 4).
+      openTelemetrySpanProcessors: buildOtlpSpanProcessors(env.OTEL_EXPORTER_OTLP_ENDPOINT),
     });
   }
 

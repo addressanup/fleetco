@@ -61,6 +61,7 @@ Validated by [zod](./src/config/env.ts) at module load. Required vars throw a st
 | `NODE_ENV` | no | `development` | Tier 4 | One of `development` / `production` / `test`. |
 | `PORT` | no | `3001` | Tier 4 | Override locally (e.g. `3011`) when a sibling project holds the default. |
 | `SENTRY_DSN` | no | (none) | **Tier 1** | When unset, Sentry init no-ops. Production value lives in the secret store. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | (none) | Tier 4 | ADR-0024. Full OTLP/HTTP traces URL (e.g. `https://collector.example.com/v1/traces`). When unset (the Phase-1 default), no OTLP exporter is built. Backend + sampling policy are chosen in Phase 2. |
 | `LOG_LEVEL` | no | `info` | Tier 4 | One of `fatal`/`error`/`warn`/`info`/`debug`/`trace`. |
 | `DATABASE_URL` | yes | — | **Tier 1** in prod / Tier 4 dev | Postgres connection string. Dev placeholder uses `fleetco:fleetco` per `docker-compose.yml`. Real prod creds in secret store. |
 | `REDIS_URL` | yes | — | **Tier 1** in prod / Tier 4 dev | Redis connection string. Dev placeholder hits the compose service. |
@@ -79,6 +80,7 @@ Conventions:
 
 - **Modules.** Each `src/modules/<name>/` directory owns its tables (via Prisma), its service interface (the only public surface), and its event emitters. Cross-module imports of internal files are forbidden per CLAUDE.md and ADR-0001; only the service interface is public. The auth module exports the `AUTH` token and `AuthGuard` class.
 - **Migrations.** Versioned and append-only. Never edit an applied migration. Never use `prisma db push` outside local exploration. Schema changes produce new migrations via `pnpm --filter @fleetco/api db:migrate`.
-- **Logging.** `nestjs-pino` provides a request-scoped logger with `x-request-id` propagation. Redact list at module config. See ADR-0018.
+- **Logging.** `nestjs-pino` provides a request-scoped logger with `x-request-id` propagation (`genReqId`). When an OpenTelemetry span is active, each log line also carries `trace_id` / `span_id` via a pino `mixin` (ADR-0024); these complement, not replace, the request id. Redact list at module config. See ADR-0018 and ADR-0024.
+- **Tracing.** Sentry v9 owns the global OpenTelemetry `TracerProvider`; the API extends that setup rather than standing up a second `NodeSDK` (ADR-0024). HTTP, Prisma, and Redis are auto-instrumented by Sentry's default integrations — nothing is registered for them by hand. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` adds an env-gated OTLP/HTTP span exporter (`buildOtlpSpanProcessors` in `src/observability/otel.ts`); unset — the Phase-1 default — it no-ops. The tracing backend, sampling policy, and span-attribute scrubbing are a Phase-2 decision (see ADR-0024 "Revisit when").
 - **Errors.** Unhandled throws reach Sentry when `SENTRY_DSN` is set. The `beforeSend` hook for Tier 2/3 stripping lands when the first user-attributable error paths appear (per ADR-0018's named gap).
 - **Bootstrap order in `main.ts`.** `bodyParser: false` at NestJS construction → mount better-auth at `/auth/{*splat}` → re-attach `useBodyParser("json")` and `useBodyParser("urlencoded", { extended: true })` → `enableCors({ origin, credentials: true })` → `listen(PORT)`. Each step matters; see ADR-0021's "Consequences — Harder" section before refactoring.
