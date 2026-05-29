@@ -14,6 +14,15 @@ import {
   UseGuards,
 } from "@nestjs/common";
 
+// nestjs-pino's Logger is injected by NestJS via emitDecoratorMetadata (see
+// apps/api/tsconfig.json); the class reference must remain a value import at
+// runtime so the DI container can resolve it — the same reason TripsService is
+// a value import below. nestjs-pino's LoggerModule is global (registered in
+// app.module.ts), so TripsController resolves it without a TripsModule import.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { Logger } from "nestjs-pino";
+
+import { SLI_TRIP_CREATION_SUCCESS } from "../../common/sli";
 import { ZodValidationPipe } from "../../common/zod-validation.pipe";
 import { AuthGuard } from "../auth/auth.guard";
 import type { AuthenticatedRequest } from "../auth/auth.types";
@@ -74,7 +83,10 @@ export interface TripsListResponse {
 @Controller("api/v1/trips")
 @UseGuards(AuthGuard)
 export class TripsController {
-  constructor(private readonly trips: TripsService) {}
+  constructor(
+    private readonly trips: TripsService,
+    private readonly logger: Logger,
+  ) {}
 
   /**
    * List trips with filter / sort / pagination. ZodValidationPipe runs
@@ -141,6 +153,22 @@ export class TripsController {
    * rejects it). The service throws BadRequestException with the
    * offending FK name when vehicleId or driverId references a
    * deleted (or never-existed) record.
+   *
+   * SLI #2 (ADR-0011, ticket T_SLI2): this method emits one
+   * trip-creation-success signal per attempt. The signal is scoped to
+   * the post-validation create operation — `ZodValidationPipe` rejects a
+   * malformed body with HTTP 400 *before* this method body runs, so
+   * request-shape rejections never enter the try/catch below and are not
+   * counted against the indicator (a scope boundary T_PERF's performance
+   * budget inherits). On success the line carries
+   * `{ sli: "trip_creation_success", sli_good: true }`; on a thrown error
+   * it carries `sli_good: false` plus `error_kind` — the exception's
+   * *class name only*, never `err.message`, which the trips FK errors
+   * embed the literal vehicle/driver id into (Tier-3 operational data per
+   * ADR-0013). The error is rethrown unchanged so the HTTP response (and
+   * the runbook's api-error-mapping contract) is unaffected by the
+   * instrumentation. The `sli` tag value comes from the shared
+   * `SLI_TRIP_CREATION_SUCCESS` constant in `common/sli.ts`, not a literal.
    */
   @Post()
   @HttpCode(HttpStatus.CREATED)
@@ -148,7 +176,18 @@ export class TripsController {
     @Body(new ZodValidationPipe(CreateTripSchema)) body: CreateTripInput,
     @Req() request: AuthenticatedRequest,
   ): Promise<TripDetail> {
-    return this.trips.create(body, request.session.user.id);
+    try {
+      const trip = await this.trips.create(body, request.session.user.id);
+      this.logger.log({ sli: SLI_TRIP_CREATION_SUCCESS, sli_good: true });
+      return trip;
+    } catch (err) {
+      // Log ONLY the exception class name (never err.message — ADR-0013):
+      // the service's FK failures embed the literal vehicle/driver id in
+      // their message. Narrow without casting through unknown/any.
+      const errorKind = err instanceof Error ? err.constructor.name : "UnknownError";
+      this.logger.log({ sli: SLI_TRIP_CREATION_SUCCESS, sli_good: false, error_kind: errorKind });
+      throw err;
+    }
   }
 
   /**
