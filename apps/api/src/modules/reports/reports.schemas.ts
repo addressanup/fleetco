@@ -103,13 +103,26 @@ export const ReportsQuerySchema = z
     vehicleId: CuidFilter,
   })
   .strict()
-  .refine((data) => data.from.getTime() <= data.to.getTime(), {
-    // The cross-field check after the per-field coerce — `from` and
-    // `to` are already Date objects here, so the comparison is a
-    // simple millisecond ordering. The error path names `to` so the
-    // web form can highlight the right input.
-    message: "`from` must be on or before `to`.",
-    path: ["to"],
-  });
+  .refine(
+    (data) => {
+      // Defensive: if either per-field transform failed (e.g., the
+      // YYYY-MM-DD regex rejected the input), Zod still calls this
+      // refine with a `NEVER` sentinel in place of the Date. Skip
+      // the cross-field check in that case so the per-field error
+      // is the one surfaced. Without this guard a refactor that
+      // tightened either DateOnly would cause refine to crash with
+      // a TypeError that escapes the ZodValidationPipe.
+      if (!(data.from instanceof Date) || !(data.to instanceof Date)) return true;
+      return data.from.getTime() <= data.to.getTime();
+    },
+    {
+      // The cross-field check after the per-field coerce — `from` and
+      // `to` are already Date objects here, so the comparison is a
+      // simple millisecond ordering. The error path names `to` so the
+      // web form can highlight the right input.
+      message: "`from` must be on or before `to`.",
+      path: ["to"],
+    },
+  );
 
 export type ReportsQuery = z.infer<typeof ReportsQuerySchema>;
