@@ -45,10 +45,10 @@ Phase 1 built the *spine* (the data + admin surfaces). The *operating model* mil
 
 - [ ] **First production deploy** — not done. Fills `../runbook/deploy.md` + `rollback.md` (still stubs).
 - [ ] **DORA metrics** — `../operations/dora-metrics.md` is still a deploy-gated stub; the first weekly entry appears the week the first deploy ships.
-- [ ] **The two SLIs** (API availability, trip-creation success; ADR-0011) — not instrumented.
+- [x] **The two SLIs** (API availability, trip-creation success; ADR-0011) — **signals instrumented** (PRs #58, #59; `apps/api/src/common/sli.ts` + `TripsController`). Live 28-day *reporting* still awaits the first deploy + a log/metrics backend.
 - [ ] **First restore-from-backup test** — not done. Fills `../runbook/restore-from-backup.md` (stub).
-- [ ] **OpenTelemetry** in the API — not added.
-- [ ] **Performance budget** (P95 < 500ms, P99 < 1500ms, admin FCP < 2s on Nepal 3G) — not committed/tracked.
+- [x] **OpenTelemetry** in the API — **added** (PR #57; ADR-0024; `apps/api/src/observability/otel.ts` — trace-ids in pino logs, env-gated OTLP exporter).
+- [x] **Performance budget** (P95 < 500ms, P99 < 1500ms, admin FCP < 2s on Nepal 3G) — **committed** (PR #60; `../operations/performance-budget.md`). Live *tracking* begins at the first deploy.
 
 ## Carried tech-debt
 
@@ -64,8 +64,8 @@ The roadmap is explicit: **we do not start a new phase until the previous one is
 
 - [ ] First production deploy shipped (deploy + rollback runbooks filled).
 - [ ] First restore-from-backup test passed (restore runbook filled).
-- [ ] The two ADR-0011 SLIs instrumented and reporting.
-- [ ] OpenTelemetry in the API; performance budget committed and tracked.
+- [ ] The two ADR-0011 SLIs instrumented and reporting. — _instrumented ✓ (PRs #58–#59); live **reporting** awaits the first deploy._
+- [ ] OpenTelemetry in the API; performance budget committed and tracked. — _OTel ✓ (PR #57) + budget committed ✓ (PR #60); live **tracking** awaits the first deploy._
 - [ ] DORA metrics file has at least one real weekly entry.
 - [ ] **The CEO is using FleetCo daily in place of spreadsheets** (the actual definition of "Phase 1 done").
 - [ ] This retrospective reviewed by the operator.
