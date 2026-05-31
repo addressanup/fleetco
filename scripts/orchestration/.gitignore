@@ -4,6 +4,7 @@ logs/
 decisions.log
 .stop
 .env
+kickoff.md
 
 # Build outputs
 dist/
