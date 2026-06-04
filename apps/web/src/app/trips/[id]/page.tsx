@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { NepaliDate } from "@/components/nepali-date";
 import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api";
 import { getServerSession } from "@/lib/session";
@@ -33,16 +34,6 @@ import { DeleteTripDialog } from "./delete-trip-dialog";
 
 interface DetailPageProps {
   params: Promise<{ id: string }>;
-}
-
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
 }
 
 function formatDateTime(iso: string | null): string {
@@ -221,7 +212,7 @@ export default async function TripDetailPage({
             <DetailRow label="Created by" value={trip.createdById} mono />
             <DetailRow label="Created at" value={formatTimestamp(trip.createdAt)} />
             <DetailRow label="Updated at" value={formatTimestamp(trip.updatedAt)} />
-            <DetailRow label="Date" value={formatDate(trip.startedAt)} />
+            <DetailRow label="Date" value={<NepaliDate iso={trip.startedAt} />} />
           </dl>
         </section>
       </div>

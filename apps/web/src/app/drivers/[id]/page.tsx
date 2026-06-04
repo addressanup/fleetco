@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { NepaliDate } from "@/components/nepali-date";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -87,18 +88,6 @@ function formatKilometers(km: number): string {
     maximumFractionDigits: 1,
   });
   return `${formatter.format(km)} km`;
-}
-
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  // Render YYYY-MM-DD; BS-calendar rendering arrives with the future
-  // <NepaliDate> component per DESIGN.md §"BS calendar".
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
 }
 
 function formatTimestamp(iso: string | null): string {
@@ -211,14 +200,17 @@ export default async function DriverDetailPage({
               value={LICENSE_CLASS_LABELS[driver.licenseClass] ?? driver.licenseClass}
             />
             <DetailRow label="Phone" value={driver.phone} mono />
-            <DetailRow label="Date of birth" value={formatDate(driver.dateOfBirth)} />
+            <DetailRow label="Date of birth" value={<NepaliDate iso={driver.dateOfBirth} />} />
             <DetailRow
               label="Status"
               value={DRIVER_STATUS_LABELS[driver.status] ?? driver.status}
             />
-            <DetailRow label="Hired at" value={formatDate(driver.hiredAt)} />
-            <DetailRow label="License expires" value={formatDate(driver.licenseExpiresAt)} />
-            <DetailRow label="Terminated at" value={formatDate(driver.terminatedAt)} />
+            <DetailRow label="Hired at" value={<NepaliDate iso={driver.hiredAt} />} />
+            <DetailRow
+              label="License expires"
+              value={<NepaliDate iso={driver.licenseExpiresAt} />}
+            />
+            <DetailRow label="Terminated at" value={<NepaliDate iso={driver.terminatedAt} />} />
             <DetailRow label="Created at" value={formatTimestamp(driver.createdAt)} />
             <DetailRow label="Updated at" value={formatTimestamp(driver.updatedAt)} />
           </dl>

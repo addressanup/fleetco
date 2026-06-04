@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
+import { NepaliDate } from "@/components/nepali-date";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -304,20 +305,6 @@ function single(value: string | string[] | undefined): string | undefined {
   return value;
 }
 
-// Render an acquisition date as YYYY-MM-DD. Matches the detail page's
-// formatDate (apps/web/src/app/vehicles/[id]/page.tsx). The BS-
-// calendar rendering arrives with the future <NepaliDate> component
-// per DESIGN.md §"BS calendar".
-function formatAcquiredDate(iso: string | null): string {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
 export default async function VehiclesPage({
   searchParams,
 }: VehiclesPageProps): Promise<React.ReactElement> {
@@ -489,7 +476,7 @@ export default async function VehiclesPage({
                         {v.make} {v.model}
                       </TableCell>
                       <TableCell className="text-text-secondary text-right tabular-nums">
-                        {formatAcquiredDate(v.acquiredAt)}
+                        <NepaliDate iso={v.acquiredAt} format="bs" />
                       </TableCell>
                       <TableCell className="text-text-secondary">
                         {VEHICLE_STATUS_LABELS[v.status] ?? v.status}

@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/table";
 import { apiFetch, ApiError } from "@/lib/api";
 import { formatNpr } from "@/lib/money";
+import { formatNepaliDate } from "@/lib/nepali-date";
 import { getServerSession } from "@/lib/session";
 
 import { PerVehicleCostFilters } from "./per-vehicle-cost-filters";
@@ -165,6 +166,13 @@ export default async function PerVehicleCostPage({
   const hasCompanyLevel = report.companyLevel.expenseLogCount > 0;
   const hasAnyRows = report.rows.length > 0;
 
+  // BS-render the report window for the subtitle (ADR-0031 N2 — "reports"
+  // is in commitment 4's BS-display scope). The `bs` variant keeps the
+  // sentence compact; the AD window stays visible in the date *inputs*
+  // (PerVehicleCostFilters), which remain native AD per commitment 6.
+  const fromBs = formatNepaliDate(report.from, { format: "bs" });
+  const toBs = formatNepaliDate(report.to, { format: "bs" });
+
   return (
     <main className="bg-surface-canvas min-h-svh">
       <div className="mx-auto max-w-6xl space-y-6 px-8 py-8">
@@ -179,8 +187,8 @@ export default async function PerVehicleCostPage({
           <h1 className="text-text-primary text-2xl font-semibold">Per-vehicle cost report</h1>
           <p className="text-text-muted text-sm">
             {hasAnyRows
-              ? `${report.rows.length} vehicle${report.rows.length === 1 ? "" : "s"} with activity from ${report.from} to ${report.to}.`
-              : `No vehicle activity from ${report.from} to ${report.to}.`}
+              ? `${report.rows.length} vehicle${report.rows.length === 1 ? "" : "s"} with activity from ${fromBs} to ${toBs}.`
+              : `No vehicle activity from ${fromBs} to ${toBs}.`}
           </p>
         </header>
 
