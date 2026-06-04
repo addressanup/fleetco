@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { NepaliDate } from "@/components/nepali-date";
 import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api";
 import { CUSTOMER_STATUS_LABELS } from "@/lib/customers-schema";
@@ -25,16 +26,6 @@ import { JOB_STATUS_LABELS, type JobDetail } from "../types";
 
 interface DetailPageProps {
   params: Promise<{ id: string }>;
-}
-
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "—";
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
 }
 
 function formatTimestamp(iso: string | null): string {
@@ -135,10 +126,13 @@ export default async function JobDetailPage({
             <DetailRow label="Job number" value={job.jobNumber} mono />
             <DetailRow label="Status" value={statusLabel} />
             <DetailRow label="Description" value={job.description} className="sm:col-span-2" />
-            <DetailRow label="Scheduled start" value={formatDate(job.scheduledStartDate)} />
-            <DetailRow label="Scheduled end" value={formatDate(job.scheduledEndDate)} />
-            <DetailRow label="Actual start" value={formatDate(job.actualStartDate)} />
-            <DetailRow label="Actual end" value={formatDate(job.actualEndDate)} />
+            <DetailRow
+              label="Scheduled start"
+              value={<NepaliDate iso={job.scheduledStartDate} />}
+            />
+            <DetailRow label="Scheduled end" value={<NepaliDate iso={job.scheduledEndDate} />} />
+            <DetailRow label="Actual start" value={<NepaliDate iso={job.actualStartDate} />} />
+            <DetailRow label="Actual end" value={<NepaliDate iso={job.actualEndDate} />} />
             <DetailRow label="Notes" value={job.notes ?? "—"} className="sm:col-span-2" />
           </dl>
         </section>
