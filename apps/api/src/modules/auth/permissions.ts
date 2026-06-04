@@ -32,6 +32,14 @@ export type Capability =
   | "fuel-logs:*"
   | "expense-logs:*"
   | "reports:read"
+  // Geofence configuration aggregate (ADR-0030 c5). A verb-token READ/WRITE
+  // split (like the gps:read-derived / gps:read-raw tokens, NOT a coarse
+  // `geofences:*`) precisely so the two operations carry DIFFERENT privilege:
+  // both live roles READ fences for the derived operational views (live map /
+  // geofence status), but only ADMIN may WRITE (redraw a boundary) — geofence
+  // boundaries are operational *configuration* at the users:manage tier.
+  | "geofences:read"
+  | "geofences:write"
   | "gps:ingest"
   | "gps:read-derived"
   | "gps:read-raw"
@@ -56,6 +64,12 @@ const OPERATIONAL_CAPABILITIES: readonly Capability[] = [
   "expense-logs:*",
   "reports:read",
   "gps:read-derived",
+  // Reading geofence configuration joins the shared floor (ADR-0030 c5):
+  // OFFICE_STAFF need to SEE the depot / customer-site / route-corridor fences
+  // the derived live-location and geofence-status views read against — exactly
+  // parallel to gps:read-derived already on this floor. WRITING fences
+  // (geofences:write) is ADMIN-only and lives in the ADMIN set below.
+  "geofences:read",
 ];
 
 // The role -> capability map, exactly per ADR-0028 c4's table. Keyed by the
@@ -79,6 +93,12 @@ export const ROLE_CAPABILITY_MAP: Record<UserRole, ReadonlySet<Capability>> = {
     "gps:read-raw",
     "gps:export-raw",
     "observability:read",
+    // Writing geofence configuration (create / update / delete a boundary) is
+    // ADMIN-only (ADR-0030 c5): redrawing the depot or a customer-site fence is
+    // operational *configuration* at the same privilege tier as users:manage —
+    // an OFFICE_STAFF session reads fences (the floor's geofences:read) but does
+    // not redraw them.
+    "geofences:write",
     "users:manage",
     "roles:assign",
   ]),
