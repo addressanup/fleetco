@@ -139,6 +139,37 @@ pnpm format && pnpm format:check && pnpm lint && pnpm typecheck && pnpm --filter
 
 CI runs the same suite against a `postgis/postgis:16-3.5` service container; see `.github/workflows/ci.yml`'s `services: postgres` block.
 
+## Running the driver app (Expo)
+
+The driver mobile app (`apps-mobile/driver/`) is a standalone Expo SDK 56 project
+**outside** the pnpm workspace (ADR-0033), so it installs with `--ignore-workspace`.
+**Expo Go is the D0–D3 runtime — no native build needed** (the custom build is
+deferred to D4 per ADR-0033 c7).
+
+```sh
+cd apps-mobile/driver
+pnpm install --ignore-workspace
+# A real phone cannot reach the dev machine's localhost, so point the app at your
+# LAN IP (or an `expo start --tunnel` URL) so it can reach the API on :3001:
+EXPO_PUBLIC_API_URL=http://<your-lan-ip>:3001 pnpm start
+# Scan the QR with Expo Go (Android). D0 shows a "Welcome to FleetCo Driver" screen.
+```
+
+**D1 — driver login.** With the API + Postgres running (steps 4–9 above), create a
+DRIVER login, then sign in on the phone:
+
+```sh
+# From the repo root:
+CREATE_USER_PASSWORD='<temp password>' \
+  pnpm --filter @fleetco/api exec tsx scripts/create-user.ts driver@fleetco.local DRIVER
+```
+
+In the app, sign in with those credentials → it shows "Signed in" with the driver's
+email and role (`DRIVER`). The DRIVER role holds **no gated capabilities yet** (it is
+inert until D2 adds own-record-scoped permissions, ADR-0034 c5), so the login proves
+auth end-to-end without exposing any fleet data. Linking the login to a `Driver` row
+(`Driver.userId`) is the D2 row-scope step.
+
 ## What can go wrong
 
 ### Port 5432 (Postgres) is already in use
