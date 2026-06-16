@@ -18,6 +18,11 @@ export default tseslint.config(
       // itself documents "This file should not be edited." Excluding it
       // from lint honors that.
       "**/next-env.d.ts",
+      // The driver mobile app (apps-mobile/) is a standalone Expo sub-project
+      // outside the pnpm workspace (ADR-0033). It owns its own ESLint
+      // (eslint-config-expo) run by the mobile CI job; the root config can't
+      // resolve React Native / Expo modules, so it ignores the whole tree.
+      "apps-mobile/**",
     ],
   },
   {

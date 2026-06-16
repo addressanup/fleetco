@@ -7,3 +7,8 @@ coverage/
 *.tsbuildinfo
 pnpm-lock.yaml
 **/*.md
+
+# The driver mobile app (apps-mobile/) is a standalone Expo sub-project outside
+# the workspace (ADR-0033). It owns its own formatting, checked by the mobile CI
+# job, not the root prettier run.
+apps-mobile/

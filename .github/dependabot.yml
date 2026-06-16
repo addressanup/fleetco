@@ -64,3 +64,37 @@ updates:
     commit-message:
       prefix: chore(deps)
       include: scope
+
+  # Component 1 (cont.): the standalone driver mobile app (apps-mobile/driver)
+  # is OUTSIDE the pnpm workspace (ADR-0033), so the recursive npm scan at "/"
+  # does not reach it. It gets its own ecosystem entry so its lockfile is not a
+  # dependency-update / security blind spot (ADR-0012). Expo SDK bumps are
+  # grouped so a coordinated upgrade arrives as one PR.
+  - package-ecosystem: npm
+    directory: /apps-mobile/driver
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Asia/Kathmandu
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+      include: scope
+    groups:
+      expo:
+        patterns:
+          - expo
+          - "expo-*"
+          - react-native
+          - "@expo/*"
+      jest:
+        patterns:
+          - jest
+          - jest-expo
+          - "@jest/*"
+          - "@types/jest"
+      linting:
+        patterns:
+          - eslint
+          - "eslint-config-*"
