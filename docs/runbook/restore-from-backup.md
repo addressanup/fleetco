@@ -10,34 +10,49 @@ Placeholders: `<vps-host>`, `<r2-bucket>`, `<backup-object>` (the dated dump, e.
 
 ## Backup (the create side)
 
-The restore below is only testable if the backups it consumes are actually produced. ADR-0014 §6 commits to a nightly `pg_dump`, gzipped + `age`-encrypted, shipped to Cloudflare R2 with 30-day retention (satisfying RPO 24 h). The backup script itself is the ADR-0014 §7 implementation follow-on; the procedure it automates is below (run on the box; `STATUS: DRAFT` until the cron is installed and a produced dump has been restored end-to-end).
+The restore below is only testable if the backups it consumes are actually produced. ADR-0014 §6 commits to a nightly `pg_dump`, gzipped + `age`-encrypted, shipped to Cloudflare R2 with 30-day retention (satisfying RPO 24 h). That procedure is now a committed, `shellcheck`-clean script — **`deploy/backup.sh`** (it was the ADR-0014 §7 implementation follow-on). The commands it runs are documented below so a reader knows exactly what it does; `STATUS: DRAFT` until the cron is installed on the box and a produced dump has been restored end-to-end.
 
-1. **Dump → compress → encrypt** in one pipe, so no plaintext dump ever lands on disk:
+**Configure + run.** `deploy/backup.sh` hardcodes no secret (ADR-0013 / CLAUDE.md); every operator value is an environment variable with a fail-fast `:?` guard. Define them in a root-owned, `chmod 600`, gitignored `/opt/fleetco/deploy/backup.env` (the script sources it automatically — the same file `deploy/restore.sh` reads), or inline them on the crontab line:
+
+```
+DB_USER        the production Postgres role        (= POSTGRES_USER in .env)
+DB_NAME        the production Postgres database     (= POSTGRES_DB   in .env)
+AGE_RECIPIENT  the age PUBLIC key the dump is encrypted to (<age-recipient>)
+R2_REMOTE      the rclone remote name for R2 (e.g. r2)
+R2_BUCKET      the R2 bucket name (<r2-bucket>)
+# optional: COMPOSE_FILE (default docker-compose.prod.yml), BACKUP_TMPDIR (default /tmp)
+```
+
+Run `deploy/backup.sh` by hand once to confirm a dump lands in R2, then schedule it (step 3 below). What the script does, step by step:
+
+1. **Dump → compress → encrypt** in one pipe, so no plaintext dump ever lands on disk (`set -o pipefail` makes a `pg_dump` failure fail the whole script instead of shipping a truncated `.age`):
    ```
    docker compose -f docker-compose.prod.yml exec -T postgres \
-     pg_dump -U <db-user> -d <db-name> --no-owner --clean --if-exists \
+     pg_dump -U "$DB_USER" -d "$DB_NAME" --no-owner --clean --if-exists \
      | gzip \
-     | age -r <age-recipient> \
+     | age -r "$AGE_RECIPIENT" \
      > /tmp/fleetco-$(date -u +%F).sql.gz.age
    ```
    Encrypt **to the recipient public key** (`-r <age-recipient>`); the matching `age` identity (`<age-key>`) is what decrypts it at restore time and lives per `business-continuity.md` — never on the backup path itself.
-2. **Upload to R2** (rclone with an R2 remote, or aws-cli against the R2 S3 endpoint), then delete the local temp file:
+2. **Upload to R2** (rclone with an R2 remote, or aws-cli against the R2 S3 endpoint), then remove the local temp file (the script's `trap … EXIT` does this even on failure):
    ```
-   rclone copy /tmp/fleetco-$(date -u +%F).sql.gz.age r2:<r2-bucket>/
+   rclone copy /tmp/fleetco-$(date -u +%F).sql.gz.age "$R2_REMOTE:$R2_BUCKET/"
    # or: aws s3 cp /tmp/fleetco-$(date -u +%F).sql.gz.age \
    #       s3://<r2-bucket>/ --endpoint-url https://<account>.r2.cloudflarestorage.com
    ```
-3. **Schedule nightly** via the box's crontab. NPT is UTC+5:45, so `15 18 * * *` UTC ≈ 00:00 Nepal time. Wrap steps 1–2 in `/opt/fleetco/backup.sh` and log:
+3. **Schedule nightly** via the box's crontab. NPT is UTC+5:45, so `15 18 * * *` UTC ≈ 00:00 Nepal time. The cron line runs the committed script and logs:
    ```
-   15 18 * * * /opt/fleetco/backup.sh >> /opt/fleetco/backup.log 2>&1
+   15 18 * * * /opt/fleetco/deploy/backup.sh >> /opt/fleetco/backup.log 2>&1
    ```
 4. **Prune to 30-day retention** (ADR-0013) at the end of the script:
    ```
-   rclone delete --min-age 30d r2:<r2-bucket>/
+   rclone delete --min-age 30d "$R2_REMOTE:$R2_BUCKET/"
    ```
 5. **Verify the morning after the first run** that a new `<backup-object>` landed in `<r2-bucket>` and is non-empty; a missing or 0-byte dump is a backup failure to fix _before_ it becomes a data-loss event. An untested backup does not exist (`docs/runbook/README.md`) — the within-two-weeks restore drill below is what proves this side actually works.
 
 ## Restore procedure
+
+The fetch → decrypt → load-into-scratch-DB → sanity-check span (steps 2–4 below) is automated by the committed **`deploy/restore.sh`**, configured by the same gitignored `deploy/backup.env` (it additionally reads `AGE_KEY`, the `age` identity that decrypts the dump). Run `deploy/restore.sh --list` to see the available dumps, then `deploy/restore.sh <backup-object>`: it loads into the scratch `fleetco_restore` DB, prints the row-count / admin-`User` sanity check, and **STOPS** — it never drops or overwrites the live database, so the cut-over (step 4) stays a deliberate by-hand step. The manual commands are kept below for the reader, and for a fresh-box rebuild where the script's assumption of a running `postgres` container does not yet hold.
 
 1. **Stop writes.** `ssh <vps-host>`; `cd /opt/fleetco`; `docker compose -f docker-compose.prod.yml stop api web` (leave `postgres` up). Nothing should write during the restore.
 2. **Fetch the backup** from R2: download `<backup-object>` from `<r2-bucket>` (rclone or aws-cli configured for R2). Choose the most recent good dump — or the last one *before* the corrupting event.
