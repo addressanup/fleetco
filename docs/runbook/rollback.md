@@ -4,14 +4,14 @@
 
 ## When this procedure applies
 
-A deploy made production worse — a Sentry error spike, `/health/ready` failing, a core operation (trip creation, fuel/expense logging) broken or producing wrong data, or any SEV1/SEV2 (ADR-0011) traced to the latest deploy. Use this to return to the last-known-good version fast and diagnose afterward. Because images are SHA-tagged in GHCR, rollback is **redeploying the previous tag — no rebuild** (ADR-0014 §8).
+A deploy made production worse — a Sentry error spike, `/health/ready` failing, a core operation (trip creation, fuel/expense logging) broken or producing wrong data, or any SEV1/SEV2 (ADR-0011) traced to the latest deploy. Use this to return to the last-known-good version fast and diagnose afterward. Because images are SHA-tagged in GHCR (CI's `push-images` job publishes `ghcr.io/addressanup/fleetco-api:<sha>` + `…-web:<sha>` on every merge to `main`), rollback is **redeploying the previous tag — no rebuild**: point `docker-compose.prod.yml`'s `${IMAGE_TAG}` at the prior good SHA and `pull` + `up -d` (ADR-0014 §8).
 
 Placeholders: `<vps-host>`, `<domain>`, `<good-sha>` (previous known-good image tag), `<bad-sha>` (the tag being backed out).
 
 ## Procedure
 
 1. Identify `<good-sha>` — the image tag from the prior good deploy (check `docs/operations/dora-metrics.md`, the GHCR tag list, or the previous merge on `main`).
-2. **Preferred:** re-run the `deploy` workflow with input `<good-sha>`. **Manual equivalent:** `ssh <vps-host>`; `cd /opt/fleetco`; `export IMAGE_TAG=<good-sha>`; `docker compose -f docker-compose.prod.yml pull`; `docker compose -f docker-compose.prod.yml up -d`.
+2. **Preferred:** re-dispatch the committed `deploy` workflow (`.github/workflows/deploy.yml`, `workflow_dispatch`) with the `sha` input set to `<good-sha>` — the same workflow that deploys forward, run with a previous good SHA (ADR-0014 §8). **Manual equivalent** (on the box): `ssh <vps-host>`; `cd /opt/fleetco`; `export IMAGE_TAG=<good-sha>`; `docker compose -f docker-compose.prod.yml pull`; `docker compose -f docker-compose.prod.yml up -d` (recreates api/web at the prior tag; postgres/redis untouched, no rebuild).
 3. **If `<bad-sha>` introduced a migration that applied successfully**, the schema has already advanced and an app-only rollback does NOT revert it. (A migration that _failed mid-apply_ is a different case — an image rollback cannot fix it; see the "`prisma migrate deploy` fails" entry in `deploy.md`, which routes it to `restore-from-backup.md`.) Decide:
    - New schema is backward-compatible with `<good-sha>` (additive columns/tables) → the app rollback is sufficient; proceed.
    - `<good-sha>` cannot run against the new schema → this is no longer a simple rollback: escalate to `restore-from-backup.md` (restore the pre-deploy DB) and treat as SEV1.
