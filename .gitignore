@@ -18,6 +18,9 @@ out/
 # Test env per ADR-0023. The committed file is `.env.test.example`;
 # the developer's local copy is gitignored.
 .env.test
+# Operator backup/restore config (deploy/backup.sh + deploy/restore.sh source it;
+# holds the R2 remote, the age recipient, and DB vars). Never commit — ADR-0014 §6.
+deploy/backup.env
 
 # Logs
 *.log
