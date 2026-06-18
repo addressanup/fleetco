@@ -1,11 +1,22 @@
-import { Injectable } from "@nestjs/common";
-// Every `@prisma/client` symbol used here is a TYPE (Prisma.Invoice* generics,
-// the InvoiceStatus / DocumentType enums in type position) — there is no value
-// usage (unlike CustomersService's `instanceof Prisma.PrismaClientKnownRequestError`
-// on its write path), so the whole import is type-only.
-import type { Prisma, InvoiceStatus, DocumentType } from "@prisma/client";
+import { BadRequestException, ConflictException, Injectable } from "@nestjs/common";
+// `Prisma` is a VALUE import now (D3 write path uses
+// `instanceof Prisma.PrismaClientKnownRequestError` to map P2003 → 400, like
+// CustomersService/JobsService). The enums InvoiceStatus / DocumentType stay
+// type-only — status comparisons here are against string literals ("DRAFT"), so
+// the runtime enum object is never needed.
+import { Prisma } from "@prisma/client";
+import type { InvoiceStatus, DocumentType } from "@prisma/client";
 
-import type { InvoiceSortColumn, InvoiceSortDir } from "./invoices.schemas";
+import type {
+  CreateInvoiceInput,
+  InvoiceSortColumn,
+  InvoiceSortDir,
+  UpdateInvoiceInput,
+} from "./invoices.schemas";
+
+// Re-export the schema-inferred input types so the controller and tests can pull
+// them from this module (the JobsService / CustomersService convention).
+export type { CreateInvoiceInput, UpdateInvoiceInput };
 
 // PrismaService is injected by NestJS via TypeScript's emitDecoratorMetadata
 // (see apps/api/tsconfig.json); the class reference must remain a value import at
@@ -173,4 +184,143 @@ export class InvoicesService {
   async findById(id: string): Promise<InvoiceDetail | null> {
     return this.prisma.invoice.findUnique({ where: { id }, include: DETAIL_INCLUDE });
   }
+
+  /**
+   * Plain Invoice lookup without the nested relations — for write paths that
+   * need the existing row (its status, to gate mutability) but not the full
+   * detail include. Mirrors JobsService.findByIdRaw / TripsService.findByIdRaw.
+   */
+  async findByIdRaw(id: string) {
+    return this.prisma.invoice.findUnique({ where: { id } });
+  }
+
+  /**
+   * Create a DRAFT invoice HEADER (ADR-0039 c5). `createdById` comes from the
+   * authenticated session, never the body (the schema's `.strict()` rejects it).
+   * `documentType` is fixed to INVOICE — a CREDIT_NOTE is created via
+   * {@link createCreditNote}; `status` defaults to DRAFT; the `number` and the
+   * frozen tax snapshot are NULL until issue (D3 issue()). The billable LINES are
+   * added in D4 — a freshly-created invoice has none.
+   *
+   * A stale `customerId` / `jobId` surfaces as HTTP 400 via mapInvoiceWriteError
+   * (Prisma P2003 → "<Field> <id> does not exist."), the JobsService precedent.
+   */
+  async create(input: CreateInvoiceInput, createdById: string): Promise<InvoiceDetail> {
+    const data: Prisma.InvoiceUncheckedCreateInput = {
+      customerId: input.customerId,
+      jobId: input.jobId ?? null,
+      serviceType: input.serviceType ?? null,
+      discountPaisa: input.discountPaisa ?? null,
+      documentType: "INVOICE",
+      status: "DRAFT",
+      createdById,
+    };
+    try {
+      return await this.prisma.invoice.create({ data, include: DETAIL_INCLUDE });
+    } catch (error) {
+      throw mapInvoiceWriteError(error, { customerId: input.customerId, jobId: input.jobId });
+    }
+  }
+
+  /**
+   * Diff-PATCH a DRAFT invoice's header (ADR-0039 c5). Returns null when the row
+   * is not found (controller maps to 404).
+   *
+   * IMMUTABILITY (the load-bearing D3 rule): only a DRAFT is editable. On an
+   * ISSUED or CANCELLED row this throws ConflictException (409) — an issued
+   * invoice's financial body is immutable and is corrected ONLY by a credit note.
+   * Combined with the `.strict()` schema (which never accepts `number`, the tax
+   * amounts, `status`, or `documentType`), every financial field is rejected on
+   * an issued invoice.
+   *
+   * `null` in the patch clears a nullable field (jobId / serviceType /
+   * discountPaisa); an omitted key leaves it (the hasOwnProperty discipline).
+   */
+  async update(id: string, input: UpdateInvoiceInput): Promise<InvoiceDetail | null> {
+    const existing = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!existing) {
+      return null;
+    }
+    if (existing.status !== "DRAFT") {
+      throw new ConflictException(
+        `Cannot modify a ${existing.status} invoice; an issued invoice is corrected only by a ` +
+          "credit note (ADR-0039 c5).",
+      );
+    }
+
+    const has = (key: keyof UpdateInvoiceInput): boolean =>
+      Object.prototype.hasOwnProperty.call(input, key);
+
+    const data: Prisma.InvoiceUncheckedUpdateInput = {
+      ...(has("customerId") && input.customerId !== undefined && { customerId: input.customerId }),
+      ...(has("jobId") && { jobId: input.jobId ?? null }),
+      ...(has("serviceType") && { serviceType: input.serviceType ?? null }),
+      ...(has("discountPaisa") && { discountPaisa: input.discountPaisa ?? null }),
+    };
+
+    try {
+      return await this.prisma.invoice.update({ where: { id }, data, include: DETAIL_INCLUDE });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+        // Row vanished between the findUnique and the update (concurrent delete).
+        return null;
+      }
+      throw mapInvoiceWriteError(error, {
+        customerId: input.customerId ?? existing.customerId,
+        jobId: input.jobId,
+      });
+    }
+  }
+
+  /**
+   * Cancel a DRAFT invoice (DRAFT → CANCELLED). Returns null when not found
+   * (controller maps to 404). Only a DRAFT can be cancelled (ADR-0039 c5): an
+   * ISSUED invoice's number is permanent and is never deleted or cancelled in
+   * place — its correction is a credit note. A non-DRAFT row throws
+   * ConflictException (409).
+   */
+  async cancel(id: string): Promise<InvoiceDetail | null> {
+    const existing = await this.prisma.invoice.findUnique({ where: { id } });
+    if (!existing) {
+      return null;
+    }
+    if (existing.status !== "DRAFT") {
+      throw new ConflictException(
+        `Only a DRAFT invoice can be cancelled; a ${existing.status} invoice's number is ` +
+          "permanent (ADR-0039 c5).",
+      );
+    }
+    return this.prisma.invoice.update({
+      where: { id },
+      data: { status: "CANCELLED" },
+      include: DETAIL_INCLUDE,
+    });
+  }
+}
+
+/**
+ * Map a Prisma write error to a clean HTTP exception (D3). A P2003 foreign-key
+ * violation on `customerId` / `jobId` / `createdById` becomes HTTP 400 naming the
+ * offending FK — the JobsService precedent (a stale FK is a bad-body problem, not
+ * a conflict). Non-Prisma / non-P2003 errors pass through unchanged.
+ */
+function mapInvoiceWriteError(
+  error: unknown,
+  ctx: { customerId?: string; jobId?: string | null },
+): unknown {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
+    const meta = error.meta as { field_name?: string; constraint?: string } | undefined;
+    const fieldName = String(meta?.field_name ?? meta?.constraint ?? "").toLowerCase();
+    if (fieldName.includes("customer")) {
+      return new BadRequestException(`Customer "${ctx.customerId}" does not exist.`);
+    }
+    if (fieldName.includes("job")) {
+      return new BadRequestException(`Job "${ctx.jobId}" does not exist.`);
+    }
+    if (fieldName.includes("createdby")) {
+      return new BadRequestException("Authenticated user no longer exists; sign in again.");
+    }
+    return new BadRequestException("A referenced record does not exist.");
+  }
+  return error;
 }
