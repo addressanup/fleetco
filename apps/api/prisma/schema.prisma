@@ -36,31 +36,33 @@ enum UserRole {
 }
 
 model User {
-  id                 String       @id
+  id                      String            @id
   /// Tier 2 PII per ADR-0013 — excluded from default logging (pino redact covers *.email).
-  email              String       @unique
-  emailVerified      Boolean      @default(false)
+  email                   String            @unique
+  emailVerified           Boolean           @default(false)
   /// Tier 2 PII per ADR-0013 — admin display name.
-  name               String
-  image              String?
+  name                    String
+  image                   String?
   /// Tier 3 per ADR-0013 — authorization metadata, not a credential or PII; intentionally NOT redacted (a session's role is operational signal).
-  role               UserRole     @default(OFFICE_STAFF)
-  createdAt          DateTime     @default(now())
-  updatedAt          DateTime     @updatedAt
-  sessions           Session[]
-  accounts           Account[]
-  vehiclesCreated    Vehicle[]    @relation("VehicleCreatedBy")
-  driversCreated     Driver[]     @relation("DriverCreatedBy")
-  tripsCreated       Trip[]       @relation("TripCreatedBy")
-  customersCreated   Customer[]   @relation("CustomerCreatedBy")
-  jobsCreated        Job[]        @relation("JobCreatedBy")
-  fuelLogsCreated    FuelLog[]    @relation("FuelLogCreatedBy")
-  expenseLogsCreated ExpenseLog[] @relation("ExpenseLogCreatedBy")
-  gpsPingsCreated    GpsPing[]    @relation("GpsPingCreatedBy")
-  geofencesCreated   Geofence[]   @relation("GeofenceCreatedBy")
+  role                    UserRole          @default(OFFICE_STAFF)
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+  sessions                Session[]
+  accounts                Account[]
+  vehiclesCreated         Vehicle[]         @relation("VehicleCreatedBy")
+  driversCreated          Driver[]          @relation("DriverCreatedBy")
+  tripsCreated            Trip[]            @relation("TripCreatedBy")
+  customersCreated        Customer[]        @relation("CustomerCreatedBy")
+  jobsCreated             Job[]             @relation("JobCreatedBy")
+  fuelLogsCreated         FuelLog[]         @relation("FuelLogCreatedBy")
+  expenseLogsCreated      ExpenseLog[]      @relation("ExpenseLogCreatedBy")
+  gpsPingsCreated         GpsPing[]         @relation("GpsPingCreatedBy")
+  geofencesCreated        Geofence[]        @relation("GeofenceCreatedBy")
+  serviceSchedulesCreated ServiceSchedule[] @relation("ServiceScheduleCreatedBy")
+  serviceRecordsCreated   ServiceRecord[]   @relation("ServiceRecordCreatedBy")
   /// The Driver this login identity is linked to, if any (ADR-0034 c4). A User
   /// with role DRIVER is linked 1:1 to a Driver row via Driver.userId.
-  driver             Driver?      @relation("DriverUser")
+  driver                  Driver?           @relation("DriverUser")
 
   @@map("user")
 }
@@ -279,6 +281,16 @@ model Vehicle {
   fuelLogs    FuelLog[]
   expenseLogs ExpenseLog[]
   gpsPings    GpsPing[]
+
+  // Preventive maintenance (ADR-0037). A vehicle is the anchor for many
+  // concurrent service schedules (a 250-hour engine service, a 500-hour
+  // hydraulic service, an annual inspection) and an unbounded, growing
+  // history of completed service records. onDelete: Restrict on both FKs
+  // (declared on the referencing models) means a vehicle with maintenance
+  // history cannot be silently deleted — the EXISTING VehiclesService.delete
+  // P2003 → 409 arm covers the new referencers with no change (ADR-0037 c1).
+  serviceSchedules ServiceSchedule[]
+  serviceRecords   ServiceRecord[]
 
   @@index([status])
   @@index([kind])
@@ -1206,4 +1218,162 @@ model Geofence {
   @@index([customerId])
   @@index([createdById])
   @@map("geofence")
+}
+
+// Preventive-maintenance scheduling. Owned by apps/api/src/modules/maintenance/
+// per ADR-0001. First Phase-3 / Program-B maintenance aggregate per ADR-0037,
+// pulled forward under the ADR-0025 ahead-of-gate pattern (ADR-0037 §"Phase
+// mismatch"), and the consumer of the engine-hours dimension ADR-0036 shipped
+// (B1/B2). Preventive maintenance is modeled as a dedicated TWO-table aggregate
+// anchored on the central Vehicle (ADR-0003) — a ServiceSchedule (a recurring
+// maintenance interval for a vehicle) and a ServiceRecord (a completed service
+// event, the history) — rather than columns on Vehicle, because the cardinality
+// is wrong for columns: a vehicle has MANY concurrent schedules and an
+// UNBOUNDED, growing history (ADR-0037 c1, the deliberate contrast with
+// ADR-0036's cardinality-one engine-hours columns). The dedicated-aggregate
+// choice mirrors ADR-0030's Geofence reasoning and the Phase-1 aggregate CRUD
+// convention.
+//
+// Tier annotations per ADR-0013: every field here is Tier 3 operational
+// business data (interval definitions, meter readings, service dates,
+// free-text names/notes) — a company asset like a Job record. There is NO PII
+// (no person names, no contact info) and NO Tier-5 location data, so — unlike
+// GpsPing's coordinates — NO new pino-redact or span-scrub entries are added
+// (over-redacting Tier 3 operational data hides the signal pino is meant to
+// surface). `notes` is free-form operator commentary; the future write-path UI
+// directs operators not to enter PII there.
+//
+// FK delete policy (ADR-0037 c1): both ServiceSchedule.vehicleId and
+// ServiceRecord.vehicleId are onDelete: Restrict (the house posture —
+// FuelLog/ExpenseLog/GpsPing all Restrict), so a vehicle with maintenance
+// history cannot be silently deleted; VehiclesService.delete's EXISTING P2003
+// → 409 arm covers the new referencers with no change. ServiceRecord's nullable
+// serviceScheduleId FK is also onDelete: Restrict — a schedule with recorded
+// history cannot be silently deleted (its ServiceSchedulesService.delete maps
+// the P2003 → 409, mirroring CustomersService). createdById follows the same
+// Restrict audit-chain posture as every other createdBy FK in the schema.
+
+// The interval dimension a service schedule is measured in (ADR-0037 c2). One
+// discriminator + one integer intervalValue in that dimension's minor units:
+//   - DISTANCE_KM   — kilometers, against Vehicle.odometerCurrentKm (trucks/tippers)
+//   - ENGINE_HOURS  — integer TENTHS OF AN HOUR, against Vehicle.engineHoursCurrent
+//                     (ADR-0036; the equipment half) — a 250-hour interval stores
+//                     as 2500, never a float (the integer-minor-units rule)
+//   - CALENDAR_DAYS — days, against the wall clock (annual/periodic inspections)
+// One discriminated enum is preferred over three nullable type-specific columns
+// because it is unambiguous and makes an impossible type a compile error (the
+// same reasoning ADR-0036 used for meterType, ADR-0030 for GeofenceType).
+enum ServiceIntervalType {
+  DISTANCE_KM
+  ENGINE_HOURS
+  CALENDAR_DAYS
+
+  @@map("service_interval_type")
+}
+
+// A schedule can be paused without deleting it (ADR-0037 c8f, mirroring
+// CustomerStatus). An INACTIVE schedule keeps its history and anchor but is
+// excluded from the due/overdue surface (B4) by the read layer.
+enum ServiceScheduleStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("service_schedule_status")
+}
+
+model ServiceSchedule {
+  id                     String                @id @default(cuid())
+  /// FK to Vehicle (the anchor, ADR-0003/0037 c1). Indexed individually so the
+  /// "schedules for this vehicle" query hits an index. onDelete: Restrict — a
+  /// vehicle with schedules cannot be deleted (VehiclesService's existing P2003
+  /// → 409 arm covers it).
+  vehicleId              String
+  vehicle                Vehicle               @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  /// Tier 3 per ADR-0013 — human-readable schedule name, free text (ADR-0037
+  /// c8b: services are open-ended/manufacturer-specific, so a free-text name
+  /// over a closed enum), e.g. "250-hour oil & filter service". Unique per
+  /// vehicle (see @@unique) so the same schedule is not defined twice on one
+  /// asset; a duplicate surfaces as P2002 → 409 with field "name".
+  name                   String
+  /// Tier 3 per ADR-0013 — optional longer description of the work. Nullable.
+  description            String?
+  /// Tier 3 per ADR-0013 — which meter dimension this interval is measured in.
+  intervalType           ServiceIntervalType
+  /// Tier 3 per ADR-0013 — interval length as an INTEGER in the type's minor
+  /// units (km / tenths-of-an-hour / days), never a float (ADR-0037 c2, the
+  /// integer-minor-units rule). A 250-hour ENGINE_HOURS interval stores as 2500.
+  intervalValue          Int
+  status                 ServiceScheduleStatus @default(ACTIVE)
+  /// Tier 3 per ADR-0013 — last-service anchor (ADR-0037 c4): when the schedule
+  /// was last serviced (UTC). "Next due" is DERIVED from the anchor + interval,
+  /// not stored. Seeded at create (operator-supplied or now()); advanced forward
+  /// on a ServiceRecord write inside one $transaction in B4.
+  lastServiceAt          DateTime
+  /// Tier 3 per ADR-0013 — odometer reading (km) captured at the last service.
+  /// Nullable: null for an ENGINE_HOURS/CALENDAR_DAYS schedule. Seeded from the
+  /// vehicle's current odometer for a DISTANCE_KM schedule (ADR-0037 c4).
+  lastServiceOdometerKm  Int?
+  /// Tier 3 per ADR-0013 — engine-hours reading (integer TENTHS OF AN HOUR)
+  /// captured at the last service. Nullable: null for a DISTANCE_KM/CALENDAR_DAYS
+  /// schedule, or for an ENGINE_HOURS schedule on a vehicle whose
+  /// engineHoursCurrent is still null. Seeded from the vehicle's current hours
+  /// for an ENGINE_HOURS schedule (ADR-0037 c4).
+  lastServiceEngineHours Int?
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+  /// References the User who created the schedule (ADR-0021). Audit field;
+  /// Restrict so the schedule's audit chain stays intact for its lifetime.
+  createdById            String
+  createdBy              User                  @relation("ServiceScheduleCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  serviceRecords ServiceRecord[]
+
+  @@unique([vehicleId, name])
+  @@index([vehicleId])
+  @@index([status])
+  @@index([createdById])
+  @@map("service_schedule")
+}
+
+model ServiceRecord {
+  id                String           @id @default(cuid())
+  /// FK to Vehicle. Indexed individually so the "service history for this
+  /// vehicle" query hits an index. onDelete: Restrict (house posture).
+  vehicleId         String
+  vehicle           Vehicle          @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  /// Nullable FK to ServiceSchedule (ADR-0037: an ad-hoc / one-off service has
+  /// no schedule). When set, onDelete: Restrict protects the linkage — a
+  /// schedule with recorded history cannot be silently deleted
+  /// (ServiceSchedulesService.delete maps the P2003 → 409). A recorded service
+  /// against a schedule advances that schedule's anchor (the $transaction lands
+  /// in B4; B3 records are plain inserts).
+  serviceScheduleId String?
+  serviceSchedule   ServiceSchedule? @relation(fields: [serviceScheduleId], references: [id], onDelete: Restrict)
+  /// When the service was performed (UTC). Indexed `(performedAt desc)` for the
+  /// default "most recent service first" list sort. ISO/UTC per CLAUDE.md;
+  /// rendered Bikram Sambat on the web side (B5).
+  performedAt       DateTime
+  /// Tier 3 per ADR-0013 — odometer reading (km) at service. Nullable (a
+  /// calendar or hours service may not capture it). Integer per the odometer
+  /// convention.
+  odometerKm        Int?
+  /// Tier 3 per ADR-0013 — engine-hours reading (integer TENTHS OF AN HOUR) at
+  /// service. Nullable. Integer minor units, never a float (the litersMl /
+  /// ADR-0036 precedent).
+  engineHours       Int?
+  /// Tier 3 per ADR-0013 — free-form operator notes. Not PII. Nullable; the
+  /// empty case is null rather than "".
+  notes             String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  /// References the User who recorded the service (ADR-0021). Audit field;
+  /// Restrict so the record's audit chain stays intact for its lifetime.
+  createdById       String
+  createdBy         User             @relation("ServiceRecordCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([vehicleId])
+  @@index([serviceScheduleId])
+  @@index([performedAt(sort: Desc)])
+  @@index([createdById])
+  @@map("service_record")
 }
