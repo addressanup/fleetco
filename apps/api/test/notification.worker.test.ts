@@ -2,6 +2,7 @@ import { BullModule, getQueueToken } from "@nestjs/bullmq";
 import { type INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { type Queue } from "bullmq";
+import { Logger } from "nestjs-pino";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
 import { Mailer } from "../src/modules/notifications/mailer";
@@ -70,6 +71,9 @@ describe("notification worker + scheduler (live Redis, ADR-0038 C2)", () => {
         // Inject the inspectable MockMailer for the Mailer token so no send
         // reaches the network and the test can assert the recorded `sent`.
         { provide: Mailer, useValue: mailer },
+        // NotificationService injects nestjs-pino's Logger (C3 reminder_delivery
+        // SLI); this module does not import LoggerModule, so bind a no-op fake.
+        { provide: Logger, useValue: { log: () => undefined } },
       ],
     }).compile();
 

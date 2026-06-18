@@ -1,8 +1,16 @@
 import { InjectQueue } from "@nestjs/bullmq";
 import { Injectable, type OnApplicationBootstrap } from "@nestjs/common";
 import { type Queue } from "bullmq";
+// nestjs-pino's Logger is injected by NestJS via emitDecoratorMetadata; the class
+// reference must remain a VALUE import at runtime so the DI container resolves it
+// by token (the same reason PrismaService/Mailer below stay value imports, and
+// the same pattern TripsController uses to emit its SLIs). LoggerModule is global
+// (app.module.ts), so this resolves without a module import.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { Logger } from "nestjs-pino";
 
 import { env } from "../../config/env";
+import { buildReminderDeliverySignal } from "../../common/sli";
 // PrismaService and Mailer are injected by NestJS via emitDecoratorMetadata (see
 // apps/api/tsconfig.json's experimentalDecorators+emitDecoratorMetadata pair);
 // their class references must remain VALUE imports at runtime so the DI
@@ -14,12 +22,12 @@ import { PrismaService } from "../prisma/prisma.service";
 import { Mailer } from "./mailer";
 import { type MailMessage, type MailerSendResult } from "./mailer";
 import {
-  SUBJECT_TYPE_VEHICLE,
   collectVehicleComplianceReminders,
   notificationDedupKey,
   type ReminderItem,
 } from "./compliance-source";
-import { renderComplianceDigest } from "./digest";
+import { collectServiceMaintenanceReminders } from "./maintenance-source";
+import { renderReminderDigest } from "./digest";
 import {
   NOTIFICATION_QUEUE,
   REMINDER_SCAN_JOB_NAME,
@@ -102,6 +110,7 @@ export class NotificationService implements OnApplicationBootstrap {
     private readonly prisma: PrismaService,
     private readonly mailer: Mailer,
     @InjectQueue(NOTIFICATION_QUEUE) private readonly queue: Queue,
+    private readonly logger: Logger,
   ) {}
 
   /**
@@ -139,7 +148,7 @@ export class NotificationService implements OnApplicationBootstrap {
       },
     });
 
-    const items = collectVehicleComplianceReminders(
+    const complianceItems = collectVehicleComplianceReminders(
       vehicles.map((v) => ({
         id: v.id,
         registrationNumber: v.registrationNumber,
@@ -149,6 +158,48 @@ export class NotificationService implements OnApplicationBootstrap {
       })),
       now,
     );
+
+    // The MAINTENANCE source (C3): every ACTIVE service schedule, classified by
+    // the SHARED `serviceScheduleState` against its vehicle's current meter
+    // reading (or the wall clock for a calendar schedule). INACTIVE schedules are
+    // excluded at the fetch layer (ADR-0037 c8f). lastServiceAt is converted to
+    // an ISO string so the pure source stays string-based, exactly as the
+    // compliance vehicles' expiry Dates are.
+    const schedules = await this.prisma.serviceSchedule.findMany({
+      where: { status: "ACTIVE" },
+      select: {
+        id: true,
+        name: true,
+        intervalType: true,
+        intervalValue: true,
+        lastServiceAt: true,
+        lastServiceOdometerKm: true,
+        lastServiceEngineHours: true,
+        vehicle: {
+          select: { registrationNumber: true, odometerCurrentKm: true, engineHoursCurrent: true },
+        },
+      },
+    });
+    const maintenanceItems = collectServiceMaintenanceReminders(
+      schedules.map((s) => ({
+        id: s.id,
+        name: s.name,
+        registrationNumber: s.vehicle.registrationNumber,
+        intervalType: s.intervalType,
+        intervalValue: s.intervalValue,
+        lastServiceAt: s.lastServiceAt.toISOString(),
+        lastServiceOdometerKm: s.lastServiceOdometerKm,
+        lastServiceEngineHours: s.lastServiceEngineHours,
+        odometerCurrentKm: s.vehicle.odometerCurrentKm,
+        engineHoursCurrent: s.vehicle.engineHoursCurrent,
+      })),
+      now,
+    );
+
+    // Both sources feed ONE scan → dedup → digest → send pipeline (ADR-0038 c4).
+    // The digest groups them by domain; the NotificationLog dedups them by the
+    // same tuple (distinct subjectTypes keep the keys from colliding).
+    const items = [...complianceItems, ...maintenanceItems];
     if (items.length === 0) {
       return { itemsConsidered: 0, remindersNewlyDue: 0, sendJobsEnqueued: 0 };
     }
@@ -170,7 +221,7 @@ export class NotificationService implements OnApplicationBootstrap {
       };
     }
 
-    const digest = renderComplianceDigest(newItems);
+    const digest = renderReminderDigest(newItems);
     const recipientLabel = recipients.join(", ");
     const logEntries: ReminderLogEntry[] = newItems.map((item) => ({
       subjectType: item.subjectType,
@@ -207,13 +258,30 @@ export class NotificationService implements OnApplicationBootstrap {
   /**
    * Deliver one digest email, then record the lapses it covered as sent (the
    * dedup ledger, ADR-0038 c5). The Mailer REJECTS on a provider error so the
-   * queue's bounded retry fires and the log is NOT written for a failed send;
-   * the C3 `reminder_delivery` SLI will count the attempt by the throw.
+   * queue's bounded retry fires and the log is NOT written for a failed send.
    * `createMany` with `skipDuplicates` makes a second per-recipient send of the
    * same digest a no-op on the rows the first send already wrote.
+   *
+   * THE reminder_delivery SLI (ADR-0038 c8): the valid event is THIS provider
+   * send ATTEMPT, so the signal is logged in the try/catch SCOPED to
+   * `mailer.send` — the good line is emitted on the provider's ack, BEFORE the
+   * NotificationLog write, so a (rare) log-write failure cannot retroactively
+   * flip a recorded provider ack. On a thrown send error the bad line carries
+   * `error_kind` (the exception CLASS NAME only — `buildReminderDeliverySignal`
+   * derives it, never `err.message`, which can embed the Tier-2 address), then
+   * the error is rethrown so BullMQ's bounded retry fires and the log stays
+   * unwritten. An idle scan never reaches here, so it is never counted (the
+   * "count attempts, not non-attempts" rule).
    */
   async send(data: ReminderSendJobData): Promise<MailerSendResult> {
-    const result = await this.mailer.send(data.message);
+    let result: MailerSendResult;
+    try {
+      result = await this.mailer.send(data.message);
+    } catch (error) {
+      this.logger.log(buildReminderDeliverySignal(error));
+      throw error;
+    }
+    this.logger.log(buildReminderDeliverySignal());
 
     if (data.logEntries.length > 0) {
       const sentAt = new Date();
@@ -238,13 +306,29 @@ export class NotificationService implements OnApplicationBootstrap {
   /**
    * Keep only the items whose dedup key is ABSENT from the NotificationLog — the
    * newly-crossed lapses (ADR-0038 c5). One query fetches the existing keys for
-   * the candidate vehicles; the in-memory diff uses the same `notificationDedupKey`
+   * the candidate subjects; the in-memory diff uses the same `notificationDedupKey`
    * the DB's @@unique enforces.
+   *
+   * The lookup matches on the (subjectType, subjectId) PAIR via an OR per present
+   * subjectType — so VEHICLE compliance and SERVICE_SCHEDULE maintenance never
+   * cross-match (both ids are cuids), and a new subject type added later needs no
+   * change here. (C2 hardcoded subjectType=VEHICLE; C3 generalizes it now that the
+   * scan emits two subject types into the same ledger.)
    */
   private async filterNewlyDue(items: readonly ReminderItem[]): Promise<ReminderItem[]> {
-    const subjectIds = [...new Set(items.map((item) => item.subjectId))];
+    const idsByType = new Map<string, Set<string>>();
+    for (const item of items) {
+      const ids = idsByType.get(item.subjectType) ?? new Set<string>();
+      ids.add(item.subjectId);
+      idsByType.set(item.subjectType, ids);
+    }
     const existing = await this.prisma.notificationLog.findMany({
-      where: { subjectType: SUBJECT_TYPE_VEHICLE, subjectId: { in: subjectIds } },
+      where: {
+        OR: [...idsByType.entries()].map(([subjectType, ids]) => ({
+          subjectType,
+          subjectId: { in: [...ids] },
+        })),
+      },
       select: {
         subjectType: true,
         subjectId: true,
