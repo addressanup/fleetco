@@ -147,19 +147,25 @@ export class ServiceSchedulesService {
     }
     assertMeterConsistency(input.intervalType, vehicle.meterType);
 
-    const has = (key: keyof CreateServiceScheduleInput): boolean =>
-      Object.prototype.hasOwnProperty.call(input, key);
-
-    const lastServiceOdometerKm = has("lastServiceOdometerKm")
-      ? (input.lastServiceOdometerKm ?? null)
-      : input.intervalType === "DISTANCE_KM"
-        ? vehicle.odometerCurrentKm
-        : null;
-    const lastServiceEngineHours = has("lastServiceEngineHours")
-      ? (input.lastServiceEngineHours ?? null)
-      : input.intervalType === "ENGINE_HOURS"
-        ? vehicle.engineHoursCurrent
-        : null;
+    // Anchor seeding (ADR-0037 c4). "Not provided" (absent in the Zod-parsed
+    // input, i.e. `undefined`) seeds the meter reading from the vehicle's
+    // current reading for the schedule's dimension; an explicitly-supplied
+    // value (including `null`) is respected. We key off `!== undefined` rather
+    // than hasOwnProperty so a present-but-undefined key (e.g. from an internal
+    // caller) is also treated as "not provided" — the real Zod flow never
+    // produces a present-with-undefined optional, so the two agree in practice.
+    const lastServiceOdometerKm =
+      input.lastServiceOdometerKm !== undefined
+        ? input.lastServiceOdometerKm
+        : input.intervalType === "DISTANCE_KM"
+          ? vehicle.odometerCurrentKm
+          : null;
+    const lastServiceEngineHours =
+      input.lastServiceEngineHours !== undefined
+        ? input.lastServiceEngineHours
+        : input.intervalType === "ENGINE_HOURS"
+          ? vehicle.engineHoursCurrent
+          : null;
 
     const data: Prisma.ServiceScheduleUncheckedCreateInput = {
       vehicleId: input.vehicleId,
