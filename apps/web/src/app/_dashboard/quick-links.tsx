@@ -28,6 +28,7 @@ const QUICK_LINKS: QuickLink[] = [
   { href: "/service-records", label: "Service history" },
   { href: "/reports/per-vehicle-cost", label: "Cost report" },
   { href: "/reports/per-vehicle-efficiency", label: "Fuel efficiency" },
+  { href: "/notification-logs", label: "Reminder history" },
 ];
 
 export function QuickLinks(): React.ReactElement {
