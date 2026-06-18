@@ -2,6 +2,7 @@ import { BullModule, getQueueToken } from "@nestjs/bullmq";
 import { type INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { type Queue } from "bullmq";
+import { Logger } from "nestjs-pino";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 import { Mailer } from "../src/modules/notifications/mailer";
@@ -62,6 +63,10 @@ describe("notification scan → send → dedup (live Redis + DB, ADR-0038 C2)", 
         // No NotificationProcessor: enqueued jobs stay waiting so the test drives
         // delivery deterministically. The MockMailer records sends, no network.
         { provide: Mailer, useValue: mailer },
+        // NotificationService injects nestjs-pino's Logger (C3 reminder_delivery
+        // SLI). This module does not import LoggerModule, so bind a no-op fake —
+        // the SLI EMISSION is asserted in notification.sli-emission.test.ts.
+        { provide: Logger, useValue: { log: () => undefined } },
       ],
     }).compile();
 

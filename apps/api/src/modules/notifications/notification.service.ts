@@ -1,8 +1,16 @@
 import { InjectQueue } from "@nestjs/bullmq";
 import { Injectable, type OnApplicationBootstrap } from "@nestjs/common";
 import { type Queue } from "bullmq";
+// nestjs-pino's Logger is injected by NestJS via emitDecoratorMetadata; the class
+// reference must remain a VALUE import at runtime so the DI container resolves it
+// by token (the same reason PrismaService/Mailer below stay value imports, and
+// the same pattern TripsController uses to emit its SLIs). LoggerModule is global
+// (app.module.ts), so this resolves without a module import.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { Logger } from "nestjs-pino";
 
 import { env } from "../../config/env";
+import { buildReminderDeliverySignal } from "../../common/sli";
 // PrismaService and Mailer are injected by NestJS via emitDecoratorMetadata (see
 // apps/api/tsconfig.json's experimentalDecorators+emitDecoratorMetadata pair);
 // their class references must remain VALUE imports at runtime so the DI
@@ -102,6 +110,7 @@ export class NotificationService implements OnApplicationBootstrap {
     private readonly prisma: PrismaService,
     private readonly mailer: Mailer,
     @InjectQueue(NOTIFICATION_QUEUE) private readonly queue: Queue,
+    private readonly logger: Logger,
   ) {}
 
   /**
@@ -249,13 +258,30 @@ export class NotificationService implements OnApplicationBootstrap {
   /**
    * Deliver one digest email, then record the lapses it covered as sent (the
    * dedup ledger, ADR-0038 c5). The Mailer REJECTS on a provider error so the
-   * queue's bounded retry fires and the log is NOT written for a failed send;
-   * the C3 `reminder_delivery` SLI will count the attempt by the throw.
+   * queue's bounded retry fires and the log is NOT written for a failed send.
    * `createMany` with `skipDuplicates` makes a second per-recipient send of the
    * same digest a no-op on the rows the first send already wrote.
+   *
+   * THE reminder_delivery SLI (ADR-0038 c8): the valid event is THIS provider
+   * send ATTEMPT, so the signal is logged in the try/catch SCOPED to
+   * `mailer.send` — the good line is emitted on the provider's ack, BEFORE the
+   * NotificationLog write, so a (rare) log-write failure cannot retroactively
+   * flip a recorded provider ack. On a thrown send error the bad line carries
+   * `error_kind` (the exception CLASS NAME only — `buildReminderDeliverySignal`
+   * derives it, never `err.message`, which can embed the Tier-2 address), then
+   * the error is rethrown so BullMQ's bounded retry fires and the log stays
+   * unwritten. An idle scan never reaches here, so it is never counted (the
+   * "count attempts, not non-attempts" rule).
    */
   async send(data: ReminderSendJobData): Promise<MailerSendResult> {
-    const result = await this.mailer.send(data.message);
+    let result: MailerSendResult;
+    try {
+      result = await this.mailer.send(data.message);
+    } catch (error) {
+      this.logger.log(buildReminderDeliverySignal(error));
+      throw error;
+    }
+    this.logger.log(buildReminderDeliverySignal());
 
     if (data.logEntries.length > 0) {
       const sentAt = new Date();

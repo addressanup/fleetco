@@ -2,11 +2,15 @@ import { describe, expect, test } from "vitest";
 
 import {
   buildAvailabilitySignal,
+  buildReminderDeliverySignal,
   enrichLogWithAvailabilitySignal,
   isAvailabilityGood,
+  isReminderDeliveryGood,
   SLI_API_AVAILABILITY,
   SLI_LATENCY_BUDGET_MS,
+  SLI_REMINDER_DELIVERY,
 } from "../src/common/sli";
+import { MailerSendError } from "../src/modules/notifications/mailer";
 
 // Unit tests for the FleetCo-authored API-availability SLI seams (ADR-0011,
 // T_SLI1). Per the ticket we pin the pure helpers — not pino-http's internal
@@ -123,5 +127,69 @@ describe("enrichLogWithAvailabilitySignal", () => {
     const val: Record<string, unknown> = { responseTime: 10 };
     enrichLogWithAvailabilitySignal({ statusCode: 200 }, val);
     expect(val).toEqual({ responseTime: 10 });
+  });
+});
+
+// The reminder-delivery SLI (ADR-0038 c8). Mirrors the API-availability pattern:
+// pin the pure helpers, not the logging behaviour. The valid event is a send
+// ATTEMPT; "good" means the attempt completed without a thrown error.
+describe("SLI_REMINDER_DELIVERY", () => {
+  test("is the reminder_delivery tag", () => {
+    expect(SLI_REMINDER_DELIVERY).toBe("reminder_delivery");
+  });
+});
+
+describe("isReminderDeliveryGood", () => {
+  test("no error (undefined / null) is a good attempt", () => {
+    expect(isReminderDeliveryGood()).toBe(true);
+    expect(isReminderDeliveryGood(undefined)).toBe(true);
+    expect(isReminderDeliveryGood(null)).toBe(true);
+  });
+
+  test("a thrown error is a bad attempt", () => {
+    expect(isReminderDeliveryGood(new Error("boom"))).toBe(false);
+    expect(isReminderDeliveryGood(new MailerSendError("rate_limit_exceeded"))).toBe(false);
+    expect(isReminderDeliveryGood("a non-Error throw")).toBe(false);
+  });
+});
+
+describe("buildReminderDeliverySignal", () => {
+  test("a successful attempt tags reminder_delivery with sli_good=true and no error_kind", () => {
+    expect(buildReminderDeliverySignal()).toEqual({
+      sli: "reminder_delivery",
+      sli_good: true,
+    });
+  });
+
+  test("a failed attempt carries the exception CLASS NAME as error_kind", () => {
+    expect(buildReminderDeliverySignal(new MailerSendError("validation_error"))).toEqual({
+      sli: SLI_REMINDER_DELIVERY,
+      sli_good: false,
+      error_kind: "MailerSendError",
+    });
+    expect(buildReminderDeliverySignal(new Error("boom"))).toEqual({
+      sli: SLI_REMINDER_DELIVERY,
+      sli_good: false,
+      error_kind: "Error",
+    });
+  });
+
+  test("a non-Error throw degrades to UnknownError", () => {
+    expect(buildReminderDeliverySignal("a string")).toEqual({
+      sli: SLI_REMINDER_DELIVERY,
+      sli_good: false,
+      error_kind: "UnknownError",
+    });
+  });
+
+  test("never leaks err.message — which could embed the recipient address (Tier-2 PII)", () => {
+    // A MailerSendError is constructed PII-free, but defense-in-depth: the signal
+    // carries only the class name, never any message text, even when the underlying
+    // error's message contains an email-like string.
+    const leaky = new Error("failed to deliver to operator@fleetco.example");
+    const signal = buildReminderDeliverySignal(leaky);
+    expect(signal.error_kind).toBe("Error");
+    expect(JSON.stringify(signal)).not.toContain("operator@fleetco.example");
+    expect(JSON.stringify(signal)).not.toContain("@");
   });
 });

@@ -74,6 +74,30 @@ export const SLI_TRIP_CREATION_SUCCESS = "trip_creation_success";
 export const SLI_TRIP_START_SUCCESS = "trip_start_success";
 
 /**
+ * The value of the `sli` field tagging a reminder-delivery signal (ADR-0011's
+ * "Revisit when" anticipated this by name; ADR-0038 commitment 8 specifies it).
+ * The reminder channel's daily scan enqueues one SEND job per recipient; the
+ * send path (`NotificationService.send`) emits one line per attempt carrying this
+ * tag plus `sli_good` (true on the provider's accept/ack, false on a
+ * thrown-and-rethrown send error) and, on failure, `error_kind` — the exception's
+ * class name ONLY, never `err.message`, which can embed the recipient address
+ * (Tier-2 PII per ADR-0013), exactly the rule the trip SLIs follow for the
+ * vehicle/driver id.
+ *
+ * THE VALID EVENT IS A SEND ATTEMPT — a `Mailer.send` against a real recipient.
+ * A scan that finds nothing to send is NOT a valid event and emits no signal, so
+ * an idle day does not inflate the denominator (the "count attempts, not
+ * non-attempts" discipline the trip SLIs follow). The target is 99.0% over a
+ * rolling 28-day window (ADR-0011's catalog); this constant only INSTRUMENTS it.
+ * Like the other Phase-2 SLIs, it emits structured signals now; the 28-day report
+ * is a post-deploy operator concern (doubly so — there are no sends to measure
+ * until the channel runs in production with a configured provider). A future
+ * report filters log lines where `sli === "reminder_delivery"` and computes the
+ * share with `sli_good === true`.
+ */
+export const SLI_REMINDER_DELIVERY = "reminder_delivery";
+
+/**
  * The structured per-request signal merged onto a request-completion log line.
  * A future 28-day report filters log lines where `sli === "api_availability"`
  * and computes the SLI as the share with `sli_good === true`.
@@ -145,4 +169,48 @@ export function enrichLogWithAvailabilitySignal(
 ): Record<string, unknown> {
   const responseTimeMs = typeof val.responseTime === "number" ? val.responseTime : 0;
   return { ...val, ...buildAvailabilitySignal(res.statusCode, responseTimeMs) };
+}
+
+/**
+ * The structured per-attempt signal logged for one reminder send (ADR-0038 c8),
+ * mirroring `AvailabilitySignal`'s shape. `error_kind` is present ONLY on a
+ * failed attempt and is the exception's class name — never the message (which can
+ * embed the recipient address, Tier-2 PII per ADR-0013).
+ */
+export interface ReminderDeliverySignal {
+  sli: typeof SLI_REMINDER_DELIVERY;
+  sli_good: boolean;
+  error_kind?: string;
+}
+
+/**
+ * The good/bad predicate for the reminder-delivery SLI: a send attempt is "good"
+ * when it completed without a thrown error (the provider accepted it).
+ * `undefined` / `null` means "no error" (a successful send); any other value is
+ * the error that was thrown and caught. The boolean and the signal builder share
+ * this single source of truth, exactly as `isAvailabilityGood` backs
+ * `buildAvailabilitySignal`.
+ */
+export function isReminderDeliveryGood(error?: unknown): boolean {
+  return error === undefined || error === null;
+}
+
+/**
+ * Build the reminder-delivery signal object for one send attempt. Pass nothing
+ * (or `undefined`/`null`) for a successful attempt; pass the caught error for a
+ * failed one. On failure, `error_kind` is derived HERE from the error's class
+ * name — never its message — so a caller cannot accidentally leak `err.message`
+ * (which can embed the Tier-2 recipient address) into the log line. A non-Error
+ * throw degrades to `"UnknownError"`, matching the trips controller's inline
+ * `err instanceof Error ? err.constructor.name : "UnknownError"`.
+ */
+export function buildReminderDeliverySignal(error?: unknown): ReminderDeliverySignal {
+  if (isReminderDeliveryGood(error)) {
+    return { sli: SLI_REMINDER_DELIVERY, sli_good: true };
+  }
+  return {
+    sli: SLI_REMINDER_DELIVERY,
+    sli_good: false,
+    error_kind: error instanceof Error ? error.constructor.name : "UnknownError",
+  };
 }
