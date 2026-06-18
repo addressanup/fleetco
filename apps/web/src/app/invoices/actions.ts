@@ -108,10 +108,13 @@ export async function createInvoiceAction(
 // (the edit form computes the diff). The changed values are raw form strings; ""
 // maps to wire `null` (clear the nullable jobId / serviceType / discount), a
 // present value is converted (discount → paisa). customerId is NOT editable here.
+// Returns { ok: true } (the calling form refreshes) rather than redirecting — the
+// edit page is the DRAFT workbench, so a header save keeps the operator there to
+// continue managing lines.
 export async function updateInvoiceHeaderAction(
   id: string,
   changed: Partial<UpdateInvoiceHeaderFormValues>,
-): Promise<ActionError | never> {
+): Promise<ActionError | ActionOk> {
   const body: Record<string, unknown> = {};
   if (Object.prototype.hasOwnProperty.call(changed, "jobId")) {
     body.jobId = changed.jobId && changed.jobId.length > 0 ? changed.jobId : null;
@@ -144,7 +147,7 @@ export async function updateInvoiceHeaderAction(
   revalidatePath("/invoices");
   revalidatePath(`/invoices/${id}`);
   revalidatePath(`/invoices/${id}/edit`);
-  redirect(`/invoices/${id}`);
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
