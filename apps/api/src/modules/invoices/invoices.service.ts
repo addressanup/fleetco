@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  InternalServerErrorException,
   NotFoundException,
   UnprocessableEntityException,
 } from "@nestjs/common";
@@ -22,6 +23,14 @@ import { computeInvoiceTax, type InvoiceTaxSnapshot } from "./invoice-tax";
 import { InvoiceNumberingService } from "./invoice-numbering.service";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { InvoiceSettingsService } from "./invoice-settings.service";
+// The D5 render+store collaborators (ADR-0039 c6/c7). Value imports for NestJS DI
+// (emitDecoratorMetadata), so the consistent-type-imports lint rule is disabled
+// the same way the numbering/settings collaborators are. The TYPE-only
+// InvoiceRenderModel rides alongside.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { InvoicePdfRenderer, type InvoiceRenderModel } from "./invoice-pdf-renderer";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ObjectStorage } from "./object-storage";
 import type {
   BuildFromJobInput,
   CreateInvoiceInput,
@@ -64,6 +73,24 @@ import { PrismaService } from "../prisma/prisma.service";
 export const LIST_TAKE_DEFAULT = 20;
 export const LIST_TAKE_MAX = 200;
 const LIST_TAKE_MIN = 1;
+
+// The R2 object key for an invoice's frozen PDF (D5 / ADR-0039 c7). Deterministic
+// + unique per invoice (an invoice is issued ONCE, so it stores exactly one PDF).
+// The key is opaque — only its uniqueness + stability matter; it is recorded in
+// Invoice.pdfR2Key at issue and read back verbatim for the download.
+function invoicePdfKey(invoiceId: string): string {
+  return `invoices/${invoiceId}.pdf`;
+}
+
+// The watermark stamped diagonally across a DRAFT preview PDF (no legal standing,
+// ADR-0039 c7) so a preview can never be mistaken for the issued tax invoice.
+const DRAFT_PDF_WATERMARK = "DRAFT — NOT A VALID TAX INVOICE";
+
+// The interactive-transaction timeout for issue() — widened from Prisma's 5s
+// default because the PDF render + the R2 put run INSIDE the transaction (issue()
+// step 5, the rollback-safety reasoning). 15s comfortably covers a slow R2
+// round-trip for a single invoice.
+const ISSUE_TX_TIMEOUT_MS = 15_000;
 
 // Slim projection for the list endpoint. The list page (D6) renders the invoice
 // number, the customer name (via nested include), the status + document-type
@@ -134,6 +161,11 @@ export class InvoicesService {
     // PUBLIC interfaces, never their tables.
     private readonly jobs: JobsService,
     private readonly trips: TripsService,
+    // D5 render+store (ADR-0039 c6/c7): the PDF renderer + the R2 object store,
+    // each behind a FleetCo-owned interface so the pdfkit / S3 vendors live in one
+    // implementation file apiece.
+    private readonly pdf: InvoicePdfRenderer,
+    private readonly storage: ObjectStorage,
   ) {}
 
   /**
@@ -384,85 +416,257 @@ export class InvoicesService {
     // (it renders on the D5 PDF); enforcing it as a precondition is a deferred
     // operator/accountant decision, flagged here rather than guessed.
 
-    return this.prisma.$transaction(async (tx) => {
-      // 1. Lock the row. Raw SELECT … FOR UPDATE returns the scalar fields the
-      //    issue flow needs; the enum columns come back as their string labels.
-      const locked = await tx.$queryRaw<
-        {
-          status: InvoiceStatus;
-          serviceType: InvoiceServiceType | null;
-          discountPaisa: number | null;
-          documentType: DocumentType;
-        }[]
-      >`
+    // R2 precondition (D5 / ADR-0039 c7): the ISSUED PDF MUST be persisted to R2
+    // at issue, so a store that is not configured blocks issue with a clear 422 —
+    // the same fail-fast posture as the supplier PAN, checked BEFORE the
+    // transaction so an unconfigured store never reaches the render/number work.
+    if (!this.storage.isConfigured()) {
+      throw new UnprocessableEntityException(
+        "Cannot issue: Cloudflare R2 object storage is not configured (R2_ENDPOINT / " +
+          "R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET). The issued invoice PDF must " +
+          "be persisted before the invoice can be issued (operator-supplied; ADR-0039 c7).",
+      );
+    }
+
+    return this.prisma.$transaction(
+      async (tx) => {
+        // 1. Lock the row. Raw SELECT … FOR UPDATE returns the scalar fields the
+        //    issue flow needs; the enum columns come back as their string labels.
+        const locked = await tx.$queryRaw<
+          {
+            status: InvoiceStatus;
+            serviceType: InvoiceServiceType | null;
+            discountPaisa: number | null;
+            documentType: DocumentType;
+          }[]
+        >`
         SELECT "status", "serviceType", "discountPaisa", "documentType"
         FROM "invoice" WHERE "id" = ${id} FOR UPDATE`;
-      const row = locked[0];
-      if (row === undefined) {
-        throw new NotFoundException(`Invoice ${id} not found`);
-      }
-      if (row.status !== "DRAFT") {
-        throw new ConflictException(
-          `Invoice ${id} is ${row.status}; only a DRAFT can be issued (ADR-0039 c5).`,
-        );
-      }
-      if (row.serviceType === null) {
-        throw new UnprocessableEntityException(
-          "Cannot issue: serviceType is required (it selects the TDS rate). Set it on the " +
-            "draft first (ADR-0039 c3/c9).",
-        );
-      }
-
-      // 2. Lines (only the captured amounts are needed for the tax math).
-      const lines = await tx.invoiceLine.findMany({
-        where: { invoiceId: id },
-        select: { lineAmountPaisa: true },
-      });
-      if (lines.length === 0) {
-        throw new UnprocessableEntityException(
-          "Cannot issue: an invoice needs at least one line (ADR-0039 c5).",
-        );
-      }
-
-      // 3. Freeze the tax snapshot. computeInvoiceTax throws on bad data (e.g. a
-      //    discount exceeding the subtotal) — surface as 422, not an opaque 500.
-      let snapshot: InvoiceTaxSnapshot;
-      try {
-        snapshot = computeInvoiceTax({
-          lineAmountsPaisa: lines.map((line) => line.lineAmountPaisa),
-          discountPaisa: row.discountPaisa ?? undefined,
-          serviceType: row.serviceType,
-        });
-      } catch (error) {
-        if (error instanceof RangeError) {
-          throw new UnprocessableEntityException(`Cannot issue: ${error.message}`);
+        const row = locked[0];
+        if (row === undefined) {
+          throw new NotFoundException(`Invoice ${id} not found`);
         }
-        throw error;
-      }
+        if (row.status !== "DRAFT") {
+          throw new ConflictException(
+            `Invoice ${id} is ${row.status}; only a DRAFT can be issued (ADR-0039 c5).`,
+          );
+        }
+        if (row.serviceType === null) {
+          throw new UnprocessableEntityException(
+            "Cannot issue: serviceType is required (it selects the TDS rate). Set it on the " +
+              "draft first (ADR-0039 c3/c9).",
+          );
+        }
 
-      // 4. Assign the gapless number for this document's series + fiscal year.
-      const number = await this.numbering.nextNumber(tx, row.documentType, issuedAt);
+        // 2. Load the full row for the render — the customer (name + PAN), the
+        //    optional job (jobNumber), and the full lines — one read of the row we
+        //    just locked. The lines validation lives here (≥ 1 line).
+        const full = await tx.invoice.findUnique({
+          where: { id },
+          include: {
+            customer: true,
+            job: true,
+            lines: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+          },
+        });
+        if (full === null) {
+          // Unreachable: the row is locked above. Fail loudly rather than render
+          // a half-built model.
+          throw new NotFoundException(`Invoice ${id} not found`);
+        }
+        if (full.lines.length === 0) {
+          throw new UnprocessableEntityException(
+            "Cannot issue: an invoice needs at least one line (ADR-0039 c5).",
+          );
+        }
 
-      // 5. Flip to ISSUED and FREEZE every figure (+ the two rates) onto the row.
-      return tx.invoice.update({
-        where: { id },
-        data: {
-          status: "ISSUED",
+        // 3. Freeze the tax snapshot. computeInvoiceTax throws on bad data (e.g. a
+        //    discount exceeding the subtotal) — surface as 422, not an opaque 500.
+        let snapshot: InvoiceTaxSnapshot;
+        try {
+          snapshot = computeInvoiceTax({
+            lineAmountsPaisa: full.lines.map((line) => line.lineAmountPaisa),
+            discountPaisa: row.discountPaisa ?? undefined,
+            serviceType: row.serviceType,
+          });
+        } catch (error) {
+          if (error instanceof RangeError) {
+            throw new UnprocessableEntityException(`Cannot issue: ${error.message}`);
+          }
+          throw error;
+        }
+
+        // 4. Assign the gapless number for this document's series + fiscal year.
+        const number = await this.numbering.nextNumber(tx, row.documentType, issuedAt);
+
+        // 5. RENDER the frozen PDF + STORE it in R2 — the anti-tamper artifact,
+        //    ADR-0039 c7. SIDE-EFFECT ORDERING (the load-bearing reasoning): the R2
+        //    write is NOT transactional with Postgres, so we render + store BEFORE
+        //    the row write that commits the number. A render or store FAILURE
+        //    throws here → the whole $transaction rolls back → the counter advance
+        //    reverts → NO gapless number is burned (the D3 rollback-safety, now
+        //    extended across the store). The opposite hazard — an ISSUED row
+        //    pointing at a missing object — cannot happen: the ISSUED flip + the
+        //    pdfR2Key write are the SAME update below, committed only AFTER the put
+        //    succeeded; a post-put commit failure leaves at worst a harmless orphan
+        //    R2 object (the draft stays DRAFT, re-issuable). The PDF is rendered
+        //    ONCE here and never again (an issued invoice is served from R2, never
+        //    re-rendered — the freeze).
+        const pdfR2Key = invoicePdfKey(id);
+        const model = this.buildRenderModel({
+          documentType: row.documentType,
           number,
-          issuedAt,
-          subtotalPaisa: snapshot.subtotalPaisa,
-          discountPaisa: snapshot.discountPaisa,
-          vatRateBp: snapshot.vatRateBp,
-          vatPaisa: snapshot.vatPaisa,
-          grossPaisa: snapshot.grossPaisa,
-          tdsRateBp: snapshot.tdsRateBp,
-          tdsPaisa: snapshot.tdsPaisa,
-          netReceivablePaisa: snapshot.netReceivablePaisa,
-          serviceType: snapshot.serviceType,
-        },
-        include: DETAIL_INCLUDE,
-      });
+          issuedAtIso: issuedAt.toISOString(),
+          customer: full.customer,
+          job: full.job,
+          lines: full.lines,
+          tax: snapshot,
+          watermark: null,
+        });
+        const buffer = await this.pdf.render(model);
+        await this.storage.put({ key: pdfR2Key, body: buffer, contentType: "application/pdf" });
+
+        // 6. Flip to ISSUED and FREEZE every figure (+ the two rates) + record the
+        //    PDF key, atomically. After commit the financial body is immutable.
+        return tx.invoice.update({
+          where: { id },
+          data: {
+            status: "ISSUED",
+            number,
+            issuedAt,
+            pdfR2Key,
+            subtotalPaisa: snapshot.subtotalPaisa,
+            discountPaisa: snapshot.discountPaisa,
+            vatRateBp: snapshot.vatRateBp,
+            vatPaisa: snapshot.vatPaisa,
+            grossPaisa: snapshot.grossPaisa,
+            tdsRateBp: snapshot.tdsRateBp,
+            tdsPaisa: snapshot.tdsPaisa,
+            netReceivablePaisa: snapshot.netReceivablePaisa,
+            serviceType: snapshot.serviceType,
+          },
+          include: DETAIL_INCLUDE,
+        });
+      },
+      // The render (~tens of ms) + the R2 put (a network round-trip) run inside
+      // the transaction, holding the row + counter locks across them. For
+      // single-operator, low-volume invoicing this is the correct trade (the
+      // anti-tamper guarantees over throughput); the timeout is widened past the
+      // 5s default to comfortably accommodate a slow R2 put.
+      { timeout: ISSUE_TX_TIMEOUT_MS },
+    );
+  }
+
+  /**
+   * Get the PDF for an invoice (D5 / ADR-0039 c6–7). The anti-tamper split:
+   *   - an **ISSUED** invoice's PDF is the FROZEN legal artifact — streamed from
+   *     R2 by its stored `pdfR2Key`, NEVER re-rendered (a re-render could diverge
+   *     from what the customer holds);
+   *   - a **DRAFT / CANCELLED** invoice regenerates a watermarked preview on
+   *     demand, with NO R2 write (it has no legal standing).
+   * Returns the bytes + a filename; the controller streams it. 404 when the
+   * invoice does not exist.
+   */
+  async getPdf(id: string): Promise<{ buffer: Buffer; filename: string }> {
+    const invoice = await this.findById(id);
+    if (invoice === null) {
+      throw new NotFoundException(`Invoice ${id} not found`);
+    }
+
+    if (invoice.status === "ISSUED") {
+      if (invoice.pdfR2Key === null) {
+        // An issued invoice always has a stored PDF (issue() persists it
+        // atomically with the number). A null key is an internal inconsistency;
+        // surface it loudly rather than re-rendering (which would break the
+        // freeze, ADR-0039 c7).
+        throw new InternalServerErrorException(
+          `Invoice ${id} is ISSUED but has no stored PDF key; an issued PDF is never ` +
+            "re-rendered (ADR-0039 c7). This indicates a storage inconsistency.",
+        );
+      }
+      const buffer = await this.storage.get(invoice.pdfR2Key);
+      return { buffer, filename: `${invoice.number ?? id}.pdf` };
+    }
+
+    // DRAFT / CANCELLED → a fresh, watermarked preview (no R2 write).
+    const buffer = await this.renderPreview(invoice);
+    const stem = invoice.documentType === "CREDIT_NOTE" ? "credit-note" : "invoice";
+    return { buffer, filename: `${stem}-draft-${id}.pdf` };
+  }
+
+  /**
+   * Render a watermarked DRAFT preview (no R2). The tax breakdown is PROVISIONAL —
+   * computed from the current lines when a serviceType is set; omitted (with a
+   * "shown at issue" note in the PDF) when it is not, or when the draft's data is
+   * not yet valid (e.g. a discount exceeding the subtotal). The frozen breakdown
+   * is fixed only at issue (ADR-0039 c3/c5).
+   */
+  private async renderPreview(invoice: InvoiceDetail): Promise<Buffer> {
+    let tax: InvoiceTaxSnapshot | null = null;
+    if (invoice.serviceType !== null) {
+      try {
+        tax = computeInvoiceTax({
+          lineAmountsPaisa: invoice.lines.map((line) => line.lineAmountPaisa),
+          discountPaisa: invoice.discountPaisa ?? undefined,
+          serviceType: invoice.serviceType,
+        });
+      } catch {
+        // A not-yet-valid draft previews without the breakdown rather than 500ing.
+        tax = null;
+      }
+    }
+    const model = this.buildRenderModel({
+      documentType: invoice.documentType,
+      number: null,
+      issuedAtIso: null,
+      customer: invoice.customer,
+      job: invoice.job,
+      lines: invoice.lines,
+      tax,
+      watermark: DRAFT_PDF_WATERMARK,
     });
+    return this.pdf.render(model);
+  }
+
+  /**
+   * Assemble the vendor-free {@link InvoiceRenderModel} the renderer consumes —
+   * the supplier identity (from {@link InvoiceSettingsService}), the buyer, the
+   * job provenance, the lines, and the tax breakdown. The single place invoice
+   * data becomes a render model, so the renderer never touches Prisma rows.
+   */
+  private buildRenderModel(input: {
+    documentType: DocumentType;
+    number: string | null;
+    issuedAtIso: string | null;
+    customer: { name: string; panNumber: string | null };
+    job: { jobNumber: string } | null;
+    lines: readonly {
+      description: string;
+      quantity: number;
+      unitPricePaisa: number;
+      lineAmountPaisa: number;
+    }[];
+    tax: InvoiceTaxSnapshot | null;
+    watermark: string | null;
+  }): InvoiceRenderModel {
+    return {
+      documentType: input.documentType,
+      number: input.number,
+      issuedAtIso: input.issuedAtIso,
+      supplierName: this.settings.getSupplierName(),
+      supplierPan: this.settings.getSupplierPan(),
+      customerName: input.customer.name,
+      customerPan: input.customer.panNumber,
+      jobNumber: input.job?.jobNumber ?? null,
+      lines: input.lines.map((line) => ({
+        description: line.description,
+        quantity: line.quantity,
+        unitPricePaisa: line.unitPricePaisa,
+        lineAmountPaisa: line.lineAmountPaisa,
+      })),
+      tax: input.tax,
+      watermark: input.watermark,
+    };
   }
 
   /**
