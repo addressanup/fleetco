@@ -13,6 +13,7 @@ import { ExpenseLogsModule } from "./modules/expense-logs/expense-logs.module";
 import { FuelLogsModule } from "./modules/fuel-logs/fuel-logs.module";
 import { GeofencesModule } from "./modules/geofences/geofences.module";
 import { HealthModule } from "./modules/health/health.module";
+import { InvoicesModule } from "./modules/invoices/invoices.module";
 import { JobsModule } from "./modules/jobs/jobs.module";
 import { MaintenanceModule } from "./modules/maintenance/maintenance.module";
 import { NotificationLogsModule } from "./modules/notification-logs/notification-logs.module";
@@ -127,6 +128,7 @@ import { VehiclesModule } from "./modules/vehicles/vehicles.module";
     TripsModule,
     CustomersModule,
     JobsModule,
+    InvoicesModule,
     FuelLogsModule,
     ExpenseLogsModule,
     ReportsModule,
