@@ -11,6 +11,7 @@ import {
   Post,
   Query,
   Req,
+  StreamableFile,
   UseGuards,
 } from "@nestjs/common";
 
@@ -128,6 +129,28 @@ export class InvoicesController {
       throw new NotFoundException(`Invoice ${id} not found`);
     }
     return invoice;
+  }
+
+  /**
+   * Download the invoice PDF (D5 / ADR-0039 c6–7). The service applies the
+   * anti-tamper split: an ISSUED invoice streams its FROZEN PDF from R2 (never
+   * re-rendered); a DRAFT / CANCELLED invoice regenerates a watermarked preview on
+   * demand (no R2 write). 404 when the invoice does not exist; 500 only for the
+   * internal "issued but no stored key" inconsistency. Served inline (the browser
+   * previews it and the operator can save), with the invoice number as the
+   * filename. AuthGuard-gated like every route on this controller.
+   *
+   * Route order note: `:id/pdf` is two-segment, so it never shadows (or is
+   * shadowed by) the single-segment `:id` read above — the same pattern
+   * `:id/issue` / `:id/lines` already use.
+   */
+  @Get(":id/pdf")
+  async getPdf(@Param("id") id: string): Promise<StreamableFile> {
+    const { buffer, filename } = await this.invoices.getPdf(id);
+    return new StreamableFile(buffer, {
+      type: "application/pdf",
+      disposition: `inline; filename="${filename}"`,
+    });
   }
 
   /**

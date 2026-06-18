@@ -10,9 +10,13 @@ import { AuthGuard } from "../src/modules/auth/auth.guard";
 import { AUTH } from "../src/modules/auth/auth.tokens";
 import { DriverScopeService } from "../src/modules/auth/driver-scope.service";
 import { InvoiceNumberingService } from "../src/modules/invoices/invoice-numbering.service";
+import { InvoicePdfRenderer } from "../src/modules/invoices/invoice-pdf-renderer";
 import { InvoiceSettingsService } from "../src/modules/invoices/invoice-settings.service";
 import { InvoicesController } from "../src/modules/invoices/invoices.controller";
 import { InvoicesService } from "../src/modules/invoices/invoices.service";
+import { MockObjectStorage } from "../src/modules/invoices/mock.object-storage";
+import { ObjectStorage } from "../src/modules/invoices/object-storage";
+import { PdfkitInvoiceRenderer } from "../src/modules/invoices/pdfkit.invoice-pdf-renderer";
 import {
   BuildFromJobSchema,
   CreateInvoiceLineSchema,
@@ -62,8 +66,16 @@ describe("Invoice lines + build-from-job (integration, real Postgres)", () => {
         TripsService,
         DriverScopeService,
         PrismaService,
-        // Stubbed so build -> issue can run (the issue precondition needs a PAN).
-        { provide: InvoiceSettingsService, useValue: { getSupplierPan: () => supplierPan } },
+        // Stubbed so build -> issue can run (the issue precondition needs a PAN);
+        // getSupplierName feeds the D5 render model (a safe default name).
+        {
+          provide: InvoiceSettingsService,
+          useValue: { getSupplierPan: () => supplierPan, getSupplierName: () => "FleetCo" },
+        },
+        // D5: the build -> issue seam test renders + stores the PDF. Real renderer
+        // + in-memory mock store (configured).
+        { provide: InvoicePdfRenderer, useValue: new PdfkitInvoiceRenderer() },
+        { provide: ObjectStorage, useValue: new MockObjectStorage() },
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
       ],
     })

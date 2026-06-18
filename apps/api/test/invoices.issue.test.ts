@@ -9,10 +9,14 @@ import { AUTH } from "../src/modules/auth/auth.tokens";
 import type { AuthenticatedRequest } from "../src/modules/auth/auth.types";
 import { DriverScopeService } from "../src/modules/auth/driver-scope.service";
 import { InvoiceNumberingService } from "../src/modules/invoices/invoice-numbering.service";
+import { InvoicePdfRenderer } from "../src/modules/invoices/invoice-pdf-renderer";
 import { InvoiceSettingsService } from "../src/modules/invoices/invoice-settings.service";
 import { computeInvoiceTax } from "../src/modules/invoices/invoice-tax";
 import { InvoicesController } from "../src/modules/invoices/invoices.controller";
 import { InvoicesService } from "../src/modules/invoices/invoices.service";
+import { MockObjectStorage } from "../src/modules/invoices/mock.object-storage";
+import { ObjectStorage } from "../src/modules/invoices/object-storage";
+import { PdfkitInvoiceRenderer } from "../src/modules/invoices/pdfkit.invoice-pdf-renderer";
 import { JobsService } from "../src/modules/jobs/jobs.service";
 import { PrismaService } from "../src/modules/prisma/prisma.service";
 import { TripsService } from "../src/modules/trips/trips.service";
@@ -56,8 +60,18 @@ describe("Invoice issue + credit-note (integration, real Postgres)", () => {
         TripsService,
         DriverScopeService,
         // The supplier-PAN config is stubbed so the issue precondition is
-        // controllable (a TEST PAN by default; null in the "not configured" test).
-        { provide: InvoiceSettingsService, useValue: { getSupplierPan: () => supplierPan } },
+        // controllable (a TEST PAN by default; null in the "not configured" test);
+        // getSupplierName feeds the D5 render model (a safe default name).
+        {
+          provide: InvoiceSettingsService,
+          useValue: { getSupplierPan: () => supplierPan, getSupplierName: () => "FleetCo" },
+        },
+        // D5: issue() now renders + stores the frozen PDF. A real renderer + an
+        // in-memory mock store (configured by default) so the existing issue
+        // assertions still hold and pdfR2Key is set; the dedicated render/store
+        // assertions live in invoices.pdf.test.ts.
+        { provide: InvoicePdfRenderer, useValue: new PdfkitInvoiceRenderer() },
+        { provide: ObjectStorage, useValue: new MockObjectStorage() },
         // AUTH satisfies AuthGuard's constructor; the guard is overridden below.
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
       ],

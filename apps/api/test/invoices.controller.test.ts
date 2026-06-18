@@ -15,9 +15,13 @@ import { AUTH } from "../src/modules/auth/auth.tokens";
 import type { AuthenticatedRequest } from "../src/modules/auth/auth.types";
 import { DriverScopeService } from "../src/modules/auth/driver-scope.service";
 import { InvoiceNumberingService } from "../src/modules/invoices/invoice-numbering.service";
+import { InvoicePdfRenderer } from "../src/modules/invoices/invoice-pdf-renderer";
 import { InvoiceSettingsService } from "../src/modules/invoices/invoice-settings.service";
 import { InvoicesController } from "../src/modules/invoices/invoices.controller";
 import { InvoicesService } from "../src/modules/invoices/invoices.service";
+import { MockObjectStorage } from "../src/modules/invoices/mock.object-storage";
+import { ObjectStorage } from "../src/modules/invoices/object-storage";
+import { PdfkitInvoiceRenderer } from "../src/modules/invoices/pdfkit.invoice-pdf-renderer";
 import {
   CreateInvoiceSchema,
   ListInvoicesQuerySchema,
@@ -144,6 +148,10 @@ describe("InvoicesController.list (integration, real Prisma)", () => {
         // AUTH is required by AuthGuard's constructor. The override below replaces
         // the guard itself, but Nest still resolves its dependencies — provide a
         // benign stub so DI does not fail on AUTH lookup.
+        // D5: InvoicesService renders + stores the issued PDF (DI must resolve
+        // these even where the test never issues).
+        { provide: InvoicePdfRenderer, useValue: new PdfkitInvoiceRenderer() },
+        { provide: ObjectStorage, useValue: new MockObjectStorage() },
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
       ],
     })
@@ -256,6 +264,10 @@ describe("InvoicesController.getById (integration, real Prisma)", () => {
         TripsService,
         DriverScopeService,
         PrismaService,
+        // D5: InvoicesService renders + stores the issued PDF (DI must resolve
+        // these even where the test never issues).
+        { provide: InvoicePdfRenderer, useValue: new PdfkitInvoiceRenderer() },
+        { provide: ObjectStorage, useValue: new MockObjectStorage() },
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
       ],
     })
@@ -420,6 +432,10 @@ describe("InvoicesController write path (integration, real Prisma)", () => {
         TripsService,
         DriverScopeService,
         PrismaService,
+        // D5: InvoicesService renders + stores the issued PDF (DI must resolve
+        // these even where the test never issues).
+        { provide: InvoicePdfRenderer, useValue: new PdfkitInvoiceRenderer() },
+        { provide: ObjectStorage, useValue: new MockObjectStorage() },
         { provide: AUTH, useValue: { api: { getSession: () => null } } },
       ],
     })
