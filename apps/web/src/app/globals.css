@@ -25,6 +25,12 @@
   --color-status-error: #dc2626;
   --color-status-info: #2563eb;
 
+  /* Non-color token that diverges from Tailwind 4's defaults (DESIGN.md
+     §"Borders and corners"). Tailwind 4 makes the bare `ring` utility 1px,
+     so the 3px focus ring is single-sourced here and pinned by the
+     design-token-drift test, rather than repeated as a magic `ring-[3px]`. */
+  --focus-ring-width: 3px;
+
   /* Font stacks. The Latin and Devanagari CSS variables
      (--font-inter, --font-noto-devanagari) are injected at
      <html> level by next/font/google in src/app/layout.tsx. */

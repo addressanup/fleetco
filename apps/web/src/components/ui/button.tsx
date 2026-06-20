@@ -14,7 +14,7 @@ import { cn } from "@/lib/utils";
 // (FleetCo ships light mode only, DESIGN.md §Color). radius.default is
 // `rounded` (4px) per §Borders, not shadcn's `rounded-md` (6px).
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 rounded text-sm font-medium whitespace-nowrap transition-all outline-none focus-visible:border-border-focus focus-visible:ring-[3px] focus-visible:ring-border-focus/50 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-status-error aria-invalid:ring-status-error/20 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "inline-flex shrink-0 items-center justify-center gap-2 rounded text-sm font-medium whitespace-nowrap transition-all outline-none focus-visible:border-border-focus focus-visible:ring-[length:var(--focus-ring-width)] focus-visible:ring-border-focus/50 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-status-error aria-invalid:ring-status-error/20 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
