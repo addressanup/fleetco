@@ -108,6 +108,12 @@ Border weights are **1px** everywhere. There is no 2px+ tier. Emphasis comes fro
 | `radius.lg` | `rounded-lg` | 8 | Modals, popovers |
 | `radius.xl` | `rounded-xl` | 12 | Reserved; not used in v1 |
 
+**Focus ring — the one deliberate exception.** The 1px / no-2px+ rule above governs **structural borders** (an element's resting edge). A **focus ring** is not a border: it is a transient `:focus-visible` affordance that sits outside the box model and exists only while the control is focused. It is intentionally thicker so a keyboard user cannot miss the focused control. `focus.ring.width` is **3px** (rendered in `color.border.focus` at 50% opacity) — the single deliberate exception to the 1px rule, applying to rings only, never to a resting border. It is single-sourced as `--focus-ring-width: 3px` in the `@theme` block; controls consume it via `ring-[length:var(--focus-ring-width)]`, and the design-token-drift test pins the DESIGN.md ↔ `@theme` match.
+
+| Token | Tailwind | Pixels | Usage |
+| --- | --- | --- | --- |
+| `focus.ring.width` | `ring-[length:var(--focus-ring-width)]` | 3 | Focus-ring thickness (the one sub-1px-rule exception) |
+
 ### Shadows and elevation
 
 Three elevation levels are sufficient for an ERP surface; deeper elevation reads as iOS-app, not as a tool.

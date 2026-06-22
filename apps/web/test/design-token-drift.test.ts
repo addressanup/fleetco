@@ -109,3 +109,28 @@ describe("DESIGN.md ↔ globals.css design-token drift", () => {
     }
   });
 });
+
+describe("DESIGN.md ↔ globals.css focus-ring token (non-color token coverage)", () => {
+  test("@theme declares --focus-ring-width and DESIGN.md §Borders documents the same 3px", () => {
+    const theme = parseThemeBlock(GLOBALS_CSS);
+    expect(
+      theme["--focus-ring-width"],
+      "globals.css @theme should declare --focus-ring-width",
+    ).toBe("3px");
+    expect(
+      /focus\.ring\.width[\s\S]{0,80}?3px/i.test(DESIGN_MD),
+      'DESIGN.md §"Borders and corners" must document focus.ring.width = 3px',
+    ).toBe(true);
+  });
+
+  test("the controls consume the focus-ring token, never a magic ring-[3px]", () => {
+    const uiDir = join(REPO_ROOT, "apps", "web", "src", "components", "ui");
+    for (const file of ["button.tsx", "input.tsx", "select.tsx"]) {
+      const src = readFileSync(join(uiDir, file), "utf-8");
+      expect(src, `${file} should reference the focus-ring token`).toMatch(
+        /ring-\[length:var\(--focus-ring-width\)\]/,
+      );
+      expect(src, `${file} should not hardcode ring-[3px]`).not.toMatch(/ring-\[3px\]/);
+    }
+  });
+});
